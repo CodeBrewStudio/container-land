@@ -1,62 +1,152 @@
 # Container Land
 
-A fast, lightweight, single-binary interface for managing a local Docker Engine on Linux.
+If you run Docker natively on Linux, you already get the best part of the deal: containers run directly on your kernel with zero virtual machine tax. What you usually lose is the nice visual dashboard from Docker Desktop when you just want to tail interleaved logs across a six-service Compose stack, pop a shell into a container, or figure out why `/var/lib/docker` quietly ate 40 GB of your SSD.
 
-Container Land gives you the everyday features of Docker Desktop on Linux without running a heavy virtual machine: live container and Docker Compose stack management, interleaved multi-container Compose log streams, an interactive in-browser `exec` terminal (`xterm.js`), image pulling and layer inspection, volume and network management, live Linux `/proc` host resource telemetry, and a safe Docker disk prune centre.
+Most alternatives either want you to run a bloated VM anyway (the horror!) or ask you to spin up a management container with a database just to look at your other containers.
 
-## Features
+I built **Container Land** to fix that. It is a single, self-contained Go binary with an embedded web UI that talks directly to your local Docker socket (`/var/run/docker.sock` or rootless) and runs quietly as a user `systemd` service on `http://127.0.0.1:8485`.
 
-- **Containers & Docker Compose Stacks**: Automatically groups containers by `com.docker.compose.project` alongside standalone containers. Start, stop, restart, or remove individual containers or entire Compose stacks in one click.
-- **Dual-Mode Right Slide-Over Inspector**:
-  - **Compose Stack Mode**: Click any Compose group row to stream live, interleaved, colour-coded logs across every container in the stack with instant service filter pills and aggregated stack CPU/RAM metrics.
-  - **Container Mode**: Click any container row for live SSE logs (`stdout`/`stderr` demuxed, search, timestamps, download), an interactive WebSocket TTY shell (`bash`/`sh`), live 1-second CPU/Memory/Network/Block I/O charts, structured Environment & Mounts inspection, and raw Inspect JSON.
-- **Images, Volumes & Networks**: Browse, search, pull images with live progress, bulk-select images or volumes with checkboxes, and inspect unattached anonymous volumes with automatic read-only content signature detection (PostgreSQL, RabbitMQ, Redis, Node `node_modules`, Docker-in-Docker, or empty volumes).
-- **Docker vs Host Telemetry & Safe Prune Centre**: Dual-colour stacked progress bars showing Docker's exact share of CPU, RAM, and disk versus the rest of the Linux host, a per-stack and per-container live RAM/CPU consumer breakdown showing how much memory is freed if stopped, and a safe-by-default Disk Prune Builder that protects local volumes unless explicitly opted in.
-- **Portable & Rootless-Ready**: Auto-discovers standard (`/var/run/docker.sock`), rootless (`$XDG_RUNTIME_DIR/docker.sock`), and custom (`DOCKER_HOST` / `--socket`) endpoints. Ships as a single self-contained Go binary with embedded web assets.
+![Containers and Compose Stack Interleaved Logs](docs/screenshots/01-compose-stack-logs.png)
 
-## Quick Start
+## What it does (and why)
+
+### 1. Compose stacks and interleaved logs in one split view
+
+When you are working on a local project, you rarely care about a single container in isolation. You care about the stack. Container Land groups your containers automatically by their `com.docker.compose.project` label alongside any standalone containers.
+
+Clicking any Compose stack opens the slide-over inspector on the right and streams live, colour-coded, interleaved logs from every service in that stack at once. You can filter down to a single service pill (`api`, `postgres`, `redis`), search in real time, toggle timestamps, or copy the lot to your clipboard in one click. Starting, stopping, or restarting a stack gives you immediate progress feedback so you are never left guessing whether Docker heard you.
+
+### 2. Instant in-browser `exec` terminal (`xterm.js`)
+
+Sometimes you just need to poke around inside a running container without opening another terminal tab and typing `docker exec -it <some-long-container-name> /bin/sh`.
+
+Click **Exec** on any running container (or switch to the **Terminal (Exec)** tab in the right drawer) to get a full interactive WebSocket TTY session powered by `xterm.js`. It automatically falls back from `bash` to `sh` on minimal Alpine images and resizes cleanly with the drawer.
+
+![Interactive Container Terminal](docs/screenshots/02-container-exec-terminal.png)
+
+### 3. Image management with multi-select and live pull streaming
+
+The **Images** view shows every local image, whether it is currently in use (and by which containers), its age, and its size.
+
+- **Pull with live layer progress**: Click **Pull Image...**, type a tag like `redis:7-alpine` or `postgres:18`, and hit `Enter` to watch the layer-by-layer download stream live.
+- **Bulk cleanup**: Tick the checkboxes next to old build artefacts and delete them in a single batch, or hit **Prune Unused Images** to clear dangling layers in one go.
+
+![Images Management and Bulk Selection](docs/screenshots/03-images-management.png)
+
+### 4. Volume inspection that actually tells you what anonymous volumes are
+
+Anyone who has used Docker for more than a week has stared at a list of unattached volumes named `3b35fe43dddc364cd84189cfb27c32626d299e776ba71f309eb3df683716be9e` and wondered: *"Is that my local Postgres database from Tuesday, or 2 GB of dead `node_modules`?"*
+
+Container Land solves this by performing a fast, read-only inspection of volume directories and matching their top-level file signatures. Even when an anonymous volume is completely unattached, the **Volumes** table tells you what is inside (`PostgreSQL 18 data (18/)`, `RabbitMQ data (mnesia)`, `Node.js packages (node_modules)`, `Docker-in-Docker (/var/lib/docker)`, or `Empty volume`). Clicking any volume opens the **Volume Inspector** drawer so you can see the exact top-level files and directories before you decide to delete it.
+
+![Volumes Content Detection and Inspector](docs/screenshots/04-volumes-inspector.png)
+
+### 5. Docker vs Host resource telemetry and safe pruning
+
+System monitors like `htop` or `btop` already show you what your Linux box is doing overall. What you actually want to know in a container manager is how much of your machine **Docker** is eating, which specific containers are responsible, and what you can get back if you stop or prune them.
+
+![Resources and Prune Centre](docs/screenshots/05-resources-and-prune.png)
+
+The **Resources & Prune** page (and the persistent top telemetry bar) uses dual-colour stacked bars to separate **Docker's consumption** from the **rest of your host system**:
+
+- **CPU & RAM (Docker vs Host)**: See the exact CPU percentage and live RAM consumed by running containers versus other host processes, plus a clear callout showing how much **RAM you will immediately reclaim** if you stop your running containers.
+- **Consumption by Running Compose Stack & Container**: A live leaderboard ranking your active Compose stacks and containers by memory footprint, complete with one-click **Stop (Free X MB)** buttons when a runaway service needs to be put to bed.
+- **Safe Disk Prune Builder**: Breaks down `/system/df` across Images, Build Cache, Stopped Containers, and Local Volumes. Named and anonymous volumes are **excluded by default** (protected behind a separate warning checkbox and confirmation modal) so a routine disk cleanup never nukes your local database state.
+
+## Setup & Installation Guide
 
 ### Prerequisites
 
-- Linux with Docker Engine (rootful or rootless)
-- Go 1.23+ and Node.js 20+ (only required when building from source)
+- **Linux** with a running Docker Engine (standard rootful `/var/run/docker.sock` or Rootless Docker).
+- **Go 1.23+** and **Node.js 20+** (only needed if you are building from source).
 
-### Build & Run
+### 1. Clone and build the single binary
+
+Building the project compiles the React + TypeScript frontend into static assets, embeds them into the Go server via `go:embed`, and outputs a single portable binary at `./bin/container-land`:
 
 ```bash
+git clone https://github.com/jgunnink/container-land.git
+cd container-land
 make build
-./bin/container-land
 ```
 
-Then open [http://127.0.0.1:8485](http://127.0.0.1:8485) in your browser (or run `./bin/container-land --open`).
+### 2. Run it directly (ad-hoc mode)
 
-### Install as a User Systemd Service
+If you just want to spin it up in your terminal right now:
+
+```bash
+./bin/container-land --open
+```
+
+This starts the server on [http://127.0.0.1:8485](http://127.0.0.1:8485) and opens your default browser.
+
+### 3. Install as a background user `systemd` service (Recommended)
+
+If you want Container Land to always be there at `http://127.0.0.1:8485` whenever you log in (without needing `sudo` or a root daemon):
 
 ```bash
 make install-service
 ```
 
-This installs the binary to `~/.local/bin/container-land` and enables the `container-land.service` user unit on `http://127.0.0.1:8485`.
+Under the hood, this:
+1. Builds `./bin/container-land` and installs it to `~/.local/bin/container-land`.
+2. Installs the portable user unit file to `~/.config/systemd/user/container-land.service`.
+3. Runs `systemctl --user daemon-reload && systemctl --user enable --now container-land.service`.
 
-To remove the service:
+Useful commands for managing the background service:
 
 ```bash
+# Check service status
+systemctl --user status container-land.service
+
+# Tail live daemon logs
+journalctl --user -u container-land.service -f
+
+# Restart after pulling updates
+make install-service && systemctl --user restart container-land.service
+
+# Stop and remove the user systemd service
 make uninstall-service
 ```
 
-## CLI Flags & Environment Variables
+## Configuration (CLI Flags & Environment Variables)
 
-| Flag | Environment Variable | Default | Description |
+Container Land works out of the box with zero configuration, auto-discovering your Docker socket in the following order:
+1. `--socket` CLI flag
+2. `DOCKER_HOST` environment variable
+3. `$XDG_RUNTIME_DIR/docker.sock` (Rootless Docker on Linux)
+4. `/var/run/docker.sock` (Standard Linux Docker Engine)
+
+| CLI Flag | Environment Variable | Default | Description |
 |---|---|---|---|
-| `--addr` | `CONTAINER_LAND_ADDR` | `127.0.0.1:8485` | HTTP listen address |
-| `--socket` | `DOCKER_HOST` | Auto-discovered | Docker daemon socket path (`unix:///...`, `/var/run/docker.sock`, or `$XDG_RUNTIME_DIR/docker.sock`) |
-| `--open` | — | `false` | Open the UI in the default browser on startup |
-| `--version` | — | — | Print version and exit |
+| `--addr` | `CONTAINER_LAND_ADDR` | `127.0.0.1:8485` | HTTP listen address and port |
+| `--socket` | `DOCKER_HOST` | Auto-discovered | Docker socket path (`unix:///var/run/docker.sock` or `tcp://...`) |
+| `--open` | None | `false` | Automatically open the web UI in your default browser on startup |
+| `--version` | None | None | Print the binary version and exit |
 
-## Security
+## Development & Testing
 
-Container Land talks directly to the local Docker daemon socket and therefore has the same privileges as your local `docker` CLI. By default, it binds strictly to loopback (`127.0.0.1:8485`). Do not expose it on an untrusted network interface without placing it behind an authenticated reverse proxy.
+ The repository is split cleanly between the zero-dependency Go backend and the React 19 + TypeScript + Tailwind CSS frontend:
 
-## License
+| Path | Purpose |
+|---|---|
+| `cmd/container-land/` | CLI entry point and graceful shutdown |
+| `internal/docker/` | Unix/TCP Docker Engine client, 8-byte stream demultiplexer, Compose grouper, volume content inspector, and TTY `exec` hijacker |
+| `internal/host/` | Linux `/proc` (`stat`, `meminfo`, `loadavg`, `uptime`, `hwmon`) and `statfs` reader |
+| `internal/server/` | HTTP API, SSE streams (daemon events, container logs, Compose logs, live stats), WebSocket `exec` bridge, and embedded SPA |
+| `web/` | React 19 + TypeScript + Tailwind CSS + `xterm.js` frontend |
+| `systemd/` | Portable user `systemd` service unit (`%h/.local/bin/container-land`) |
 
-[MIT](./LICENSE)
+To run the full test suite (Go `-race` unit/integration tests, Vitest frontend tests, TypeScript typecheck, and Vite production build):
+
+```bash
+make test
+```
+
+## Security Notes
+
+Container Land communicates directly with your local Docker Engine socket, which means anyone who can reach its HTTP port has the same privileges as your local `docker` CLI user. For that reason, Container Land binds strictly to loopback (`127.0.0.1:8485`) by default. Do not bind `--addr 0.0.0.0:8485` on an untrusted network unless you place it behind an authenticated reverse proxy or Tailscale ACL.
+
+## Licence
+
+Released under the [MIT Licence](./LICENSE). If you run into a bug or have an idea that would make daily Docker life on Linux better, issues and pull requests are very welcome.
