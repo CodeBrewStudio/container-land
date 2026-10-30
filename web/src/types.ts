@@ -216,6 +216,9 @@ export interface ImageSummary {
 
 export interface VolumeSummary {
   name: string;
+  shortName: string;
+  anonymous: boolean;
+  composeProject?: string;
   driver: string;
   mountpoint: string;
   createdAt: string;
@@ -225,6 +228,9 @@ export interface VolumeSummary {
   refCount: number;
   inUse: boolean;
   usedByContainers?: string[];
+  mountPaths?: string[];
+  contentHint?: string;
+  topEntries?: string[];
 }
 
 export interface NetworkContainerEndpoint {

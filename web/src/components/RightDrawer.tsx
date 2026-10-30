@@ -4,6 +4,8 @@ import {
   Download,
   Eye,
   EyeOff,
+  FolderOpen,
+  HardDrive,
   Play,
   RotateCw,
   Square,
@@ -16,9 +18,11 @@ import type {
   ContainerStats,
   ContainerSummary,
   LogEntry,
+  VolumeSummary,
 } from '../types';
 import {
   formatBytes,
+  formatRelativeTime,
   formatShortTimestamp,
   isSecretEnvKey,
   stripAnsi,
@@ -27,7 +31,8 @@ import { ExecTerminal } from './ExecTerminal';
 
 export type DrawerSelection =
   | { kind: 'container'; container: ContainerSummary; initialTab?: ContainerTab }
-  | { kind: 'compose'; group: ComposeGroup };
+  | { kind: 'compose'; group: ComposeGroup }
+  | { kind: 'volume'; volume: VolumeSummary };
 
 export type ContainerTab = 'logs' | 'exec' | 'stats' | 'env' | 'inspect';
 
@@ -37,6 +42,7 @@ interface RightDrawerProps {
   onContainerAction: (id: string, action: 'start' | 'stop' | 'restart' | 'delete') => Promise<void>;
   onComposeAction: (project: string, action: 'start' | 'stop' | 'restart' | 'remove') => Promise<void>;
   onSelectContainer: (ctr: ContainerSummary, tab?: ContainerTab) => void;
+  onDeleteVolume?: (name: string) => void;
 }
 
 const SERVICE_COLOURS = [
@@ -63,6 +69,7 @@ export function RightDrawer({
   onContainerAction,
   onComposeAction,
   onSelectContainer,
+  onDeleteVolume,
 }: RightDrawerProps) {
   const [activeTab, setActiveTab] = useState<ContainerTab>(
     selection.kind === 'container' && selection.initialTab ? selection.initialTab : 'logs'
@@ -75,7 +82,7 @@ export function RightDrawer({
     }
   }, [selection]);
 
-  //Logs state (used by both Container logs and Compose stack logs)
+  // Logs state (used by both Container logs and Compose stack logs)
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [logSearch, setLogSearch] = useState('');
   const [showTimestamps, setShowTimestamps] = useState(true);
@@ -90,11 +97,12 @@ export function RightDrawer({
   const [revealSecrets, setRevealSecrets] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Reset service filter when switching compose stack
   const selectionKey =
     selection.kind === 'container'
       ? `ctr:${selection.container.id}`
-      : `compose:${selection.group.name}`;
+      : selection.kind === 'compose'
+        ? `compose:${selection.group.name}`
+        : `vol:${selection.volume.name}`;
 
   useEffect(() => {
     setSelectedService('all');
@@ -103,6 +111,9 @@ export function RightDrawer({
 
   // Stream SSE logs for either Container Mode (when activeTab === 'logs') or Compose Stack Mode
   useEffect(() => {
+    if (selection.kind === 'volume') {
+      return;
+    }
     if (selection.kind === 'container' && activeTab !== 'logs') {
       return;
     }
@@ -202,14 +213,17 @@ export function RightDrawer({
     });
   }, [logs, logSearch, selection.kind, selectedService]);
 
-  const downloadLogs = (filenamePrefix: string) => {
-    const content = filteredLogs
+  const formatVisibleLogsText = () =>
+    filteredLogs
       .map((l) => {
         const ts = l.timestamp ? `${l.timestamp} ` : '';
         const svc = l.service ? `[${l.service}] ` : '';
         return `${ts}${svc}[${l.stream}] ${stripAnsi(l.message)}`;
       })
       .join('\n');
+
+  const downloadLogs = (filenamePrefix: string) => {
+    const content = formatVisibleLogsText();
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -226,6 +240,202 @@ export function RightDrawer({
   };
 
   // =========================================================================
+  // MODE C: VOLUME INSPECTOR DRAWER
+  // =========================================================================
+  if (selection.kind === 'volume') {
+    const vol = selection.volume;
+    const labelEntries = Object.entries(vol.labels || {});
+    return (
+      <aside
+        aria-label={`Volume inspector for ${vol.shortName}`}
+        className="w-1/2 bg-[var(--bg-card)] border-l border-[var(--border-subtle)] flex flex-col min-w-0 shrink-0 select-text"
+      >
+        <div className="px-3.5 py-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-sidebar)] flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 border border-purple-500/30">
+                VOLUME
+              </span>
+              <h2 className="font-mono text-sm font-semibold truncate" title={vol.name}>
+                {vol.shortName}
+              </h2>
+              {vol.anonymous ? (
+                <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 text-xs font-mono">
+                  Anonymous
+                </span>
+              ) : (
+                <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-400 text-xs font-mono">
+                  Named
+                </span>
+              )}
+            </div>
+            <div className="text-xs text-[var(--text-muted)] font-mono mt-0.5 truncate">
+              Driver: {vol.driver} · Size:{' '}
+              {vol.sizeBytes >= 0 ? formatBytes(vol.sizeBytes) : 'Unknown'} · Created{' '}
+              {formatRelativeTime(vol.createdAt)}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0 text-xs">
+            {onDeleteVolume && (
+              <button
+                type="button"
+                disabled={vol.inUse}
+                onClick={() => onDeleteVolume(vol.name)}
+                className="px-2 py-1 rounded border border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 disabled:opacity-40 inline-flex items-center gap-1"
+                title={
+                  vol.inUse
+                    ? 'Cannot delete volume while attached to a container'
+                    : 'Delete volume'
+                }
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Delete</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close inspector drawer"
+              className="p-1 rounded hover:bg-[var(--bg-elevated)] text-[var(--text-muted)]"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 p-3.5 overflow-auto bg-[var(--bg-canvas)] space-y-3 text-xs">
+          {/* Inferred Content / Purpose Card */}
+          <div className="p-3.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 font-semibold text-sm">
+                <HardDrive className="w-4 h-4 text-purple-400" />
+                <span>Inferred Volume Purpose &amp; Contents</span>
+              </div>
+              <span
+                className={`px-2 py-0.5 rounded font-mono text-xs ${
+                  vol.inUse
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : 'bg-zinc-500/15 text-[var(--text-muted)]'
+                }`}
+              >
+                {vol.inUse ? 'Attached' : 'Unattached (Orphaned)'}
+              </span>
+            </div>
+
+            <div className="p-2.5 rounded bg-[var(--bg-sidebar)] border border-[var(--border-subtle)]">
+              <div className="text-[var(--text-muted)] text-xs">Detected Content Signature</div>
+              <div className="text-sm font-mono font-semibold text-purple-400 mt-0.5">
+                {vol.contentHint || 'Unknown / Uninspected volume'}
+              </div>
+              {vol.anonymous && !vol.inUse && (
+                <p className="text-xs text-[var(--text-muted)] mt-1">
+                  This is an unattached anonymous volume (created automatically by a container&apos;s{' '}
+                  <code className="font-mono">VOLUME</code> instruction when the container ran, and
+                  left behind when the container was removed without <code className="font-mono">-v</code>).
+                </p>
+              )}
+            </div>
+
+            <div>
+              <div className="flex items-center gap-1.5 text-[var(--text-muted)] font-medium mb-1.5">
+                <FolderOpen className="w-3.5 h-3.5 text-sky-400" />
+                <span>
+                  Top-Level Files &amp; Directories Inside Volume ({vol.topEntries?.length ?? 0})
+                </span>
+              </div>
+              {!vol.topEntries || vol.topEntries.length === 0 ? (
+                <div className="p-2 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono text-[var(--text-muted)]">
+                  Volume directory is empty (0 files).
+                </div>
+              ) : (
+                <div className="flex flex-wrap gap-1.5 p-2.5 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono">
+                  {vol.topEntries.map((entry) => (
+                    <span
+                      key={entry}
+                      className="px-2 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs"
+                    >
+                      {entry}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Container Mounts */}
+          <div className="p-3.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2">
+            <div className="font-semibold">Container Mounts</div>
+            {vol.mountPaths && vol.mountPaths.length > 0 ? (
+              <div className="space-y-1 font-mono">
+                {vol.mountPaths.map((mp) => (
+                  <div
+                    key={mp}
+                    className="p-2 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] text-emerald-400"
+                  >
+                    {mp}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[var(--text-muted)]">
+                Not currently mounted by any running or stopped container.
+              </div>
+            )}
+          </div>
+
+          {/* Full Volume ID & Host Path */}
+          <div className="p-3.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2 font-mono">
+            <div className="flex items-center justify-between">
+              <span className="font-sans font-semibold">Volume Identifier &amp; Host Path</span>
+              <button
+                type="button"
+                onClick={() => copyText('vol-name', vol.name)}
+                className="px-2 py-0.5 rounded border border-[var(--border-subtle)] bg-[var(--bg-canvas)] inline-flex items-center gap-1 font-sans text-xs"
+              >
+                <Copy className="w-3 h-3" />
+                <span>{copiedKey === 'vol-name' ? 'Copied!' : 'Copy Full Name'}</span>
+              </button>
+            </div>
+            <div className="space-y-1 text-xs break-all">
+              <div>
+                <span className="text-[var(--text-muted)]">Name: </span>
+                <span>{vol.name}</span>
+              </div>
+              <div>
+                <span className="text-[var(--text-muted)]">Mountpoint: </span>
+                <span className="text-[var(--text-muted)]">{vol.mountpoint}</span>
+              </div>
+              {vol.composeProject && (
+                <div>
+                  <span className="text-[var(--text-muted)]">Compose Project: </span>
+                  <span className="text-sky-400">{vol.composeProject}</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Volume Labels */}
+          {labelEntries.length > 0 && (
+            <div className="p-3.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2 font-mono">
+              <div className="font-sans font-semibold">Docker Labels ({labelEntries.length})</div>
+              <div className="divide-y divide-[var(--border-subtle)]">
+                {labelEntries.map(([k, v]) => (
+                  <div key={k} className="py-1 break-all">
+                    <span className="text-sky-400">{k}</span>
+                    <span className="text-[var(--text-muted)]"> = </span>
+                    <span>{v || '""'}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </aside>
+    );
+  }
+
+  // =========================================================================
   // MODE B: COMPOSE STACK DRAWER
   // =========================================================================
   if (selection.kind === 'compose') {
@@ -240,7 +450,7 @@ export function RightDrawer({
     return (
       <aside
         aria-label={`Compose stack inspector for ${group.name}`}
-        className="w-1/2 bg-[var(--bg-card)] border-l border-[var(--border-subtle)] flex flex-col min-w-0 shrink-0"
+        className="w-1/2 bg-[var(--bg-card)] border-l border-[var(--border-subtle)] flex flex-col min-w-0 shrink-0 select-text"
       >
         {/* Header */}
         <div className="px-3.5 py-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-sidebar)] flex items-center justify-between gap-2">
@@ -343,7 +553,7 @@ export function RightDrawer({
             value={logSearch}
             onChange={(e) => setLogSearch(e.target.value)}
             placeholder="Filter interleaved stack logs..."
-            className="px-2.5 py-1 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs w-56 font-mono focus:outline-none"
+            className="px-2.5 py-1 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs w-52 font-mono focus:outline-none"
           />
           <div className="flex items-center gap-1.5 font-mono text-xs">
             <button
@@ -366,6 +576,15 @@ export function RightDrawer({
             </button>
             <button
               type="button"
+              onClick={() => copyText('stack-logs', formatVisibleLogsText())}
+              className="px-2 py-0.5 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] inline-flex items-center gap-1"
+              title="Copy visible logs to clipboard"
+            >
+              <Copy className="w-3 h-3" />
+              <span>{copiedKey === 'stack-logs' ? 'Copied!' : 'Copy'}</span>
+            </button>
+            <button
+              type="button"
               onClick={() => downloadLogs(group.name)}
               className="px-2 py-0.5 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] inline-flex items-center gap-1"
               title="Download stack logs"
@@ -378,7 +597,7 @@ export function RightDrawer({
         {/* Interleaved Stack Log Stream */}
         <div
           ref={logContainerRef}
-          className="flex-1 p-3 font-mono text-xs overflow-auto space-y-1 bg-[var(--bg-canvas)]"
+          className="flex-1 p-3 font-mono text-xs overflow-auto space-y-1 bg-[var(--bg-canvas)] select-text cursor-text"
         >
           {filteredLogs.length === 0 ? (
             <div className="text-[var(--text-muted)] py-8 text-center">
@@ -391,7 +610,7 @@ export function RightDrawer({
               return (
                 <div
                   key={idx}
-                  className={`leading-relaxed ${
+                  className={`leading-relaxed select-text ${
                     wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
                   }`}
                 >
@@ -434,7 +653,7 @@ export function RightDrawer({
   return (
     <aside
       aria-label={`Container inspector for ${ctr.name}`}
-      className="w-1/2 bg-[var(--bg-card)] border-l border-[var(--border-subtle)] flex flex-col min-w-0 shrink-0"
+      className="w-1/2 bg-[var(--bg-card)] border-l border-[var(--border-subtle)] flex flex-col min-w-0 shrink-0 select-text"
     >
       {/* Container Header */}
       <div className="px-3.5 py-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-sidebar)] flex items-center justify-between gap-2">
@@ -553,7 +772,7 @@ export function RightDrawer({
               value={logSearch}
               onChange={(e) => setLogSearch(e.target.value)}
               placeholder="Filter container logs..."
-              className="px-2.5 py-1 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs w-52 font-mono focus:outline-none"
+              className="px-2.5 py-1 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs w-48 font-mono focus:outline-none"
             />
             <div className="flex items-center gap-1.5 font-mono text-xs">
               <button
@@ -583,6 +802,15 @@ export function RightDrawer({
               </button>
               <button
                 type="button"
+                onClick={() => copyText('ctr-logs', formatVisibleLogsText())}
+                className="px-2 py-0.5 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] inline-flex items-center gap-1"
+                title="Copy visible logs to clipboard"
+              >
+                <Copy className="w-3 h-3" />
+                <span>{copiedKey === 'ctr-logs' ? 'Copied!' : 'Copy'}</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => downloadLogs(ctr.name)}
                 className="px-2 py-0.5 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] inline-flex items-center gap-1"
                 title="Download .log"
@@ -594,7 +822,7 @@ export function RightDrawer({
 
           <div
             ref={logContainerRef}
-            className="flex-1 p-3 font-mono text-xs overflow-auto space-y-1"
+            className="flex-1 p-3 font-mono text-xs overflow-auto space-y-1 select-text cursor-text"
           >
             {filteredLogs.length === 0 ? (
               <div className="text-[var(--text-muted)] py-8 text-center">
@@ -604,7 +832,7 @@ export function RightDrawer({
               filteredLogs.map((entry, idx) => (
                 <div
                   key={idx}
-                  className={`leading-relaxed ${
+                  className={`leading-relaxed select-text ${
                     wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
                   }`}
                 >
@@ -841,7 +1069,7 @@ export function RightDrawer({
               <span>{copiedKey === 'inspect-json' ? 'Copied!' : 'Copy JSON'}</span>
             </button>
           </div>
-          <pre className="flex-1 p-3.5 overflow-auto font-mono text-xs leading-relaxed text-[var(--text-muted)]">
+          <pre className="flex-1 p-3.5 overflow-auto font-mono text-xs leading-relaxed text-[var(--text-muted)] select-text">
             {JSON.stringify(inspectDetail?.raw ?? inspectDetail ?? {}, null, 2)}
           </pre>
         </div>

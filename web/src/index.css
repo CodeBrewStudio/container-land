@@ -34,8 +34,23 @@ body,
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
-/* Native <dialog> modal scroll containment per modern-web-guidance */
+/* Interactive elements cursor fix (Tailwind v4 Preflight resets buttons to default) */
+button:not(:disabled),
+select,
+summary,
+[role="button"],
+input[type="checkbox"],
+label:has(input[type="checkbox"]) {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* Native <dialog> modal scroll containment & centering per modern-web-guidance */
 dialog:modal {
+  margin: auto;
   overscroll-behavior: contain;
   background-color: var(--bg-card);
   color: var(--text-main);

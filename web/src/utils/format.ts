@@ -32,6 +32,13 @@ export function formatRelativeEpoch(epochSeconds: number): string {
   return `${months}mo ago`;
 }
 
+export function formatRelativeTime(isoDate?: string): string {
+  if (!isoDate) return '—';
+  const ms = Date.parse(isoDate);
+  if (Number.isNaN(ms)) return isoDate;
+  return formatRelativeEpoch(Math.floor(ms / 1000));
+}
+
 export function formatShortTimestamp(iso?: string): string {
   if (!iso) return '';
   const match = iso.match(/T(\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)/);

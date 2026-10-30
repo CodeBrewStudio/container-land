@@ -149,9 +149,12 @@ type ImageSummary struct {
 	UsedByContainers []string `json:"usedByContainers"`
 }
 
-// VolumeSummary represents a Docker volume enriched with disk usage and container references.
+// VolumeSummary represents a Docker volume enriched with disk usage, container mount paths, and content hints.
 type VolumeSummary struct {
 	Name             string            `json:"name"`
+	ShortName        string            `json:"shortName"`
+	Anonymous        bool              `json:"anonymous"`
+	ComposeProject   string            `json:"composeProject,omitempty"`
 	Driver           string            `json:"driver"`
 	Mountpoint       string            `json:"mountpoint"`
 	CreatedAt        string            `json:"createdAt"`
@@ -161,6 +164,9 @@ type VolumeSummary struct {
 	RefCount         int64             `json:"refCount"`
 	InUse            bool              `json:"inUse"`
 	UsedByContainers []string          `json:"usedByContainers"`
+	MountPaths       []string          `json:"mountPaths"`
+	ContentHint      string            `json:"contentHint,omitempty"`
+	TopEntries       []string          `json:"topEntries,omitempty"`
 }
 
 // NetworkContainerEndpoint represents a container attached to a Docker network.

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   Box,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Cpu,
@@ -9,6 +11,7 @@ import {
   Download,
   HardDrive,
   Layers,
+  Loader2,
   Network,
   Play,
   Plus,
@@ -34,6 +37,7 @@ import type {
 import {
   formatBytes,
   formatRelativeEpoch,
+  formatRelativeTime,
   formatUptime,
   matchesContainerFilter,
 } from './utils/format';
@@ -46,10 +50,24 @@ import {
 type MainView = 'containers' | 'images' | 'volumes' | 'networks' | 'resources';
 type ColorSchemeSetting = 'light dark' | 'dark' | 'light';
 
+interface ToastNotification {
+  id: string;
+  message: string;
+  status: 'pending' | 'success' | 'error';
+}
+
+interface ConfirmActionState {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  onConfirm: () => Promise<void>;
+}
+
 export function App() {
   const [activeView, setActiveView] = useState<MainView>('containers');
   const [sseConnected, setSseConnected] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<ToastNotification[]>([]);
+  const [pendingActions, setPendingActions] = useState<Record<string, string>>({});
 
   // Data states
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
@@ -74,6 +92,7 @@ export function App() {
   // Images view UI state
   const [imageQuery, setImageQuery] = useState('');
   const [imageFilter, setImageFilter] = useState<'all' | 'in-use' | 'unused'>('all');
+  const [selectedImageIds, setSelectedImageIds] = useState<Set<string>>(new Set());
   const pullDialogRef = useRef<HTMLDialogElement | null>(null);
   const [pullImageRef, setPullImageRef] = useState('');
   const [pulling, setPulling] = useState(false);
@@ -82,9 +101,14 @@ export function App() {
   // Volumes view UI state
   const [volumeQuery, setVolumeQuery] = useState('');
   const [volumeFilter, setVolumeFilter] = useState<'all' | 'in-use' | 'unused'>('all');
+  const [selectedVolumeNames, setSelectedVolumeNames] = useState<Set<string>>(new Set());
   const createVolumeDialogRef = useRef<HTMLDialogElement | null>(null);
   const [newVolumeName, setNewVolumeName] = useState('');
   const confirmVolumePruneDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  // Generic Confirmation Modal state (for deleting images, volumes, containers, networks)
+  const confirmActionDialogRef = useRef<HTMLDialogElement | null>(null);
+  const [confirmState, setConfirmState] = useState<ConfirmActionState | null>(null);
 
   // Networks view UI state
   const [networkQuery, setNetworkQuery] = useState('');
@@ -144,11 +168,38 @@ export function App() {
     return () => window.removeEventListener('storage', onStorage);
   }, []);
 
-  const showToast = useCallback((msg: string) => {
-    setToastMessage(msg);
+  // Toast helpers
+  const pushToast = useCallback(
+    (message: string, status: 'pending' | 'success' | 'error' = 'success'): string => {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setToasts((prev) => [...prev.slice(-4), { id, message, status }]);
+      if (status !== 'pending') {
+        setTimeout(() => {
+          setToasts((prev) => prev.filter((t) => t.id !== id));
+        }, 4000);
+      }
+      return id;
+    },
+    []
+  );
+
+  const updateToast = useCallback(
+    (id: string, message: string, status: 'success' | 'error') => {
+      setToasts((prev) =>
+        prev.map((t) => (t.id === id ? { ...t, message, status } : t))
+      );
+      setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 4000);
+    },
+    []
+  );
+
+  const openConfirmDialog = useCallback((state: ConfirmActionState) => {
+    setConfirmState(state);
     setTimeout(() => {
-      setToastMessage((curr) => (curr === msg ? null : curr));
-    }, 4000);
+      confirmActionDialogRef.current?.showModal();
+    }, 0);
   }, []);
 
   // Data fetchers
@@ -170,9 +221,9 @@ export function App() {
       if (r.ok) {
         const data = (await r.json()) as ContainersResponse;
         setContainersData(data);
-        // Keep active drawer selection fresh
         setDrawerSelection((prev) => {
           if (!prev) return null;
+          if (prev.kind === 'volume') return prev;
           if (prev.kind === 'compose') {
             const updatedGroup = data.composeGroups.find(
               (g) => g.name === prev.group.name
@@ -201,7 +252,18 @@ export function App() {
   const fetchImages = useCallback(async () => {
     try {
       const r = await fetch('/api/images');
-      if (r.ok) setImages((await r.json()) as ImageSummary[]);
+      if (r.ok) {
+        const list = (await r.json()) as ImageSummary[];
+        setImages(list);
+        setSelectedImageIds((prev) => {
+          const valid = new Set(list.map((i) => i.id));
+          const next = new Set<string>();
+          prev.forEach((id) => {
+            if (valid.has(id)) next.add(id);
+          });
+          return next;
+        });
+      }
     } catch {
       // ignore
     }
@@ -210,7 +272,23 @@ export function App() {
   const fetchVolumes = useCallback(async () => {
     try {
       const r = await fetch('/api/volumes');
-      if (r.ok) setVolumes((await r.json()) as VolumeSummary[]);
+      if (r.ok) {
+        const list = (await r.json()) as VolumeSummary[];
+        setVolumes(list);
+        setSelectedVolumeNames((prev) => {
+          const valid = new Set(list.map((v) => v.name));
+          const next = new Set<string>();
+          prev.forEach((n) => {
+            if (valid.has(n)) next.add(n);
+          });
+          return next;
+        });
+        setDrawerSelection((prev) => {
+          if (!prev || prev.kind !== 'volume') return prev;
+          const updated = list.find((v) => v.name === prev.volume.name);
+          return updated ? { kind: 'volume', volume: updated } : null;
+        });
+      }
     } catch {
       // ignore
     }
@@ -238,7 +316,6 @@ export function App() {
   // Initial load + SSE event stream subscription
   useEffect(() => {
     fetchOverview();
-    // Instant container list (<15ms) followed by live CPU/RAM stats enrichment
     fetchContainers(false).then(() => fetchContainers(true));
     fetchImages();
     fetchVolumes();
@@ -264,7 +341,6 @@ export function App() {
       fetchNetworks();
     });
 
-    // Periodic container CPU/RAM refresh every 5s
     const interval = setInterval(() => {
       fetchContainers(true);
     }, 5000);
@@ -275,7 +351,7 @@ export function App() {
     };
   }, [fetchOverview, fetchContainers, fetchImages, fetchVolumes, fetchNetworks]);
 
-  // Keyboard shortcuts: '/' focuses container filter, 'Escape' closes right drawer
+  // Keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
@@ -291,18 +367,39 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [activeView, drawerSelection]);
 
-  // Actions
-  const handleContainerAction = async (
+  // All containers helper
+  const allContainers = useMemo(() => {
+    return [
+      ...containersData.composeGroups.flatMap((g) => g.containers),
+      ...(containersData.standalone ?? []),
+    ];
+  }, [containersData]);
+
+  // Container lifecycle action with immediate toast feedback & confirmation on delete
+  const executeContainerAction = async (
     id: string,
     action: 'start' | 'stop' | 'restart' | 'delete'
   ) => {
+    const targetCtr = allContainers.find((c) => c.id === id);
+    const label = targetCtr ? targetCtr.name : id.slice(0, 12);
+    const actionKey = `ctr:${id}`;
+    const verbMap = {
+      start: ['Starting', 'started'],
+      stop: ['Stopping', 'stopped'],
+      restart: ['Restarting', 'restarted'],
+      delete: ['Deleting', 'deleted'],
+    } as const;
+    const [gerund, past] = verbMap[action];
+
+    setPendingActions((prev) => ({ ...prev, [actionKey]: action }));
+    const toastId = pushToast(`${gerund} container ${label}...`, 'pending');
+
     try {
       if (action === 'delete') {
         const r = await fetch(`/api/containers/${encodeURIComponent(id)}?force=true`, {
           method: 'DELETE',
         });
         if (!r.ok) throw new Error(await r.text());
-        showToast('Container deleted');
         if (
           drawerSelection?.kind === 'container' &&
           drawerSelection.container.id === id
@@ -315,38 +412,92 @@ export function App() {
           { method: 'POST' }
         );
         if (!r.ok) throw new Error(await r.text());
-        showToast(`Container ${action}ed`);
       }
+      updateToast(toastId, `Container ${label} ${past}`, 'success');
       await fetchContainers(true);
       await fetchOverview(true);
     } catch (err) {
-      showToast(`Action failed: ${err instanceof Error ? err.message : String(err)}`);
+      updateToast(
+        toastId,
+        `Failed to ${action} ${label}: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
+    } finally {
+      setPendingActions((prev) => {
+        const next = { ...prev };
+        delete next[actionKey];
+        return next;
+      });
     }
   };
 
+  const handleContainerAction = async (
+    id: string,
+    action: 'start' | 'stop' | 'restart' | 'delete'
+  ) => {
+    if (action === 'delete') {
+      const targetCtr = allContainers.find((c) => c.id === id);
+      const label = targetCtr ? targetCtr.name : id.slice(0, 12);
+      openConfirmDialog({
+        title: `Delete Container "${label}"?`,
+        description: `This will permanently remove container "${label}"${
+          targetCtr?.state === 'running' ? ' (stopping it first)' : ''
+        }. Named volumes will be preserved.`,
+        confirmLabel: 'Delete Container',
+        onConfirm: () => executeContainerAction(id, 'delete'),
+      });
+      return;
+    }
+    await executeContainerAction(id, action);
+  };
+
+  // Compose Stack lifecycle action with immediate toast feedback
   const handleComposeAction = async (
     project: string,
     action: 'start' | 'stop' | 'restart' | 'remove'
   ) => {
+    const actionKey = `stack:${project}`;
+    const verbMap = {
+      start: ['Starting', 'started'],
+      stop: ['Stopping', 'stopped'],
+      restart: ['Restarting', 'restarted'],
+      remove: ['Removing', 'removed'],
+    } as const;
+    const [gerund, past] = verbMap[action];
+
+    setPendingActions((prev) => ({ ...prev, [actionKey]: action }));
+    const toastId = pushToast(`${gerund} stack ${project}...`, 'pending');
+
     try {
       const r = await fetch(
         `/api/compose/${encodeURIComponent(project)}/${action}`,
         { method: 'POST' }
       );
       if (!r.ok) throw new Error(await r.text());
-      showToast(`Stack ${project}: ${action} complete`);
+      updateToast(toastId, `Stack ${project} ${past}`, 'success');
       if (action === 'remove') {
         setDrawerSelection(null);
       }
       await fetchContainers(true);
       await fetchOverview(true);
     } catch (err) {
-      showToast(`Stack action failed: ${err instanceof Error ? err.message : String(err)}`);
+      updateToast(
+        toastId,
+        `Stack ${project} ${action} failed: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
+    } finally {
+      setPendingActions((prev) => {
+        const next = { ...prev };
+        delete next[actionKey];
+        return next;
+      });
     }
   };
 
   const executePrune = async (req: PruneRequest) => {
     setPruning(true);
+    const toastId = pushToast('Pruning selected unused Docker resources...', 'pending');
     try {
       const r = await fetch('/api/system/prune', {
         method: 'POST',
@@ -356,10 +507,18 @@ export function App() {
       if (!r.ok) throw new Error(await r.text());
       const res = (await r.json()) as PruneResponse;
       setLastPruneResult(res);
-      showToast(`Reclaimed ${formatBytes(res.totalReclaimedBytes)}`);
+      updateToast(
+        toastId,
+        `Prune complete — reclaimed ${formatBytes(res.totalReclaimedBytes)}`,
+        'success'
+      );
       await refreshAll();
     } catch (err) {
-      showToast(`Prune failed: ${err instanceof Error ? err.message : String(err)}`);
+      updateToast(
+        toastId,
+        `Prune failed: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
     } finally {
       setPruning(false);
     }
@@ -373,12 +532,13 @@ export function App() {
     }
   };
 
-  // Pull image handler using native <dialog>
+  // Pull image handler using native <dialog> and <form onSubmit>
   const startImagePull = () => {
     const ref = pullImageRef.trim();
-    if (!ref) return;
+    if (!ref || pulling) return;
     setPulling(true);
     setPullLogs([`Pulling ${ref}...`]);
+    const toastId = pushToast(`Pulling image ${ref}...`, 'pending');
     const es = new EventSource(`/api/images/pull?image=${encodeURIComponent(ref)}`);
     es.addEventListener('progress', (ev) => {
       try {
@@ -401,34 +561,93 @@ export function App() {
       setPullLogs((prev) => [...prev, `✓ Successfully pulled ${ref}`]);
       fetchImages();
       fetchOverview(true);
-      showToast(`Pulled ${ref}`);
+      updateToast(toastId, `Successfully pulled ${ref}`, 'success');
     });
     es.addEventListener('error', (ev) => {
       es.close();
       setPulling(false);
       const data = (ev as MessageEvent).data;
       setPullLogs((prev) => [...prev, `✗ Pull failed ${data || ''}`]);
+      updateToast(toastId, `Failed to pull ${ref}`, 'error');
     });
   };
 
-  const handleDeleteImage = async (id: string, force = false) => {
-    try {
-      const r = await fetch(
-        `/api/images/${encodeURIComponent(id)}?force=${force}`,
-        { method: 'DELETE' }
-      );
-      if (!r.ok) throw new Error(await r.text());
-      showToast('Image removed');
-      await fetchImages();
-      await fetchOverview(true);
-    } catch (err) {
-      showToast(`Failed to remove image: ${err instanceof Error ? err.message : String(err)}`);
+  // Single & Bulk Image deletion with confirmation modal
+  const executeDeleteImages = async (targetImages: ImageSummary[]) => {
+    const label =
+      targetImages.length === 1
+        ? `${targetImages[0].repository}:${targetImages[0].tag}`
+        : `${targetImages.length} images`;
+    const toastId = pushToast(`Deleting ${label}...`, 'pending');
+    let deletedCount = 0;
+    let lastError = '';
+
+    for (const img of targetImages) {
+      try {
+        const r = await fetch(
+          `/api/images/${encodeURIComponent(img.id)}?force=true`,
+          { method: 'DELETE' }
+        );
+        if (!r.ok) {
+          lastError = await r.text();
+        } else {
+          deletedCount++;
+        }
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
     }
+
+    if (deletedCount === targetImages.length) {
+      updateToast(toastId, `Deleted ${label}`, 'success');
+    } else if (deletedCount > 0) {
+      updateToast(
+        toastId,
+        `Deleted ${deletedCount}/${targetImages.length} images (${lastError})`,
+        'error'
+      );
+    } else {
+      updateToast(toastId, `Failed to delete ${label}: ${lastError}`, 'error');
+    }
+
+    setSelectedImageIds(new Set());
+    await fetchImages();
+    await fetchOverview(true);
+  };
+
+  const confirmDeleteSingleImage = (img: ImageSummary) => {
+    const tagLabel = `${img.repository}:${img.tag} (${img.shortId})`;
+    openConfirmDialog({
+      title: `Delete Image "${img.repository}:${img.tag}"?`,
+      description: img.inUse
+        ? `Image ${tagLabel} is referenced by container(s) (${(img.usedByContainers ?? []).join(', ')}). Deleting it will untag or force-remove the image.`
+        : `This will permanently remove image ${tagLabel} (${formatBytes(img.sizeBytes)}) from your local Docker Engine.`,
+      confirmLabel: 'Delete Image',
+      onConfirm: () => executeDeleteImages([img]),
+    });
+  };
+
+  const confirmDeleteSelectedImages = () => {
+    const targets = images.filter((img) => selectedImageIds.has(img.id));
+    if (targets.length === 0) return;
+    const totalBytes = targets.reduce((acc, i) => acc + i.sizeBytes, 0);
+    const inUseCount = targets.filter((i) => i.inUse).length;
+    openConfirmDialog({
+      title: `Delete ${targets.length} Selected Image${targets.length > 1 ? 's' : ''}?`,
+      description: `You are about to delete ${targets.length} image${
+        targets.length > 1 ? 's' : ''
+      } (${formatBytes(totalBytes)} total)${
+        inUseCount > 0 ? `, including ${inUseCount} currently referenced by containers` : ''
+      }.`,
+      confirmLabel: `Delete ${targets.length} Image${targets.length > 1 ? 's' : ''}`,
+      onConfirm: () => executeDeleteImages(targets),
+    });
   };
 
   const handleCreateVolume = async () => {
     const name = newVolumeName.trim();
     if (!name) return;
+    const toastId = pushToast(`Creating volume ${name}...`, 'pending');
     try {
       const r = await fetch('/api/volumes', {
         method: 'POST',
@@ -438,39 +657,117 @@ export function App() {
       if (!r.ok) throw new Error(await r.text());
       setNewVolumeName('');
       createVolumeDialogRef.current?.close();
-      showToast(`Created volume ${name}`);
+      updateToast(toastId, `Created volume ${name}`, 'success');
       await fetchVolumes();
       await fetchOverview(true);
     } catch (err) {
-      showToast(`Failed to create volume: ${err instanceof Error ? err.message : String(err)}`);
+      updateToast(
+        toastId,
+        `Failed to create volume: ${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
     }
   };
 
-  const handleDeleteVolume = async (name: string) => {
-    try {
-      const r = await fetch(`/api/volumes/${encodeURIComponent(name)}?force=true`, {
-        method: 'DELETE',
-      });
-      if (!r.ok) throw new Error(await r.text());
-      showToast(`Deleted volume ${name}`);
-      await fetchVolumes();
-      await fetchOverview(true);
-    } catch (err) {
-      showToast(`Failed to delete volume: ${err instanceof Error ? err.message : String(err)}`);
+  // Single & Bulk Volume deletion with confirmation modal
+  const executeDeleteVolumes = async (targetVolumes: VolumeSummary[]) => {
+    const label =
+      targetVolumes.length === 1
+        ? targetVolumes[0].shortName
+        : `${targetVolumes.length} volumes`;
+    const toastId = pushToast(`Deleting ${label}...`, 'pending');
+    let deletedCount = 0;
+    let lastError = '';
+
+    for (const vol of targetVolumes) {
+      try {
+        const r = await fetch(`/api/volumes/${encodeURIComponent(vol.name)}?force=true`, {
+          method: 'DELETE',
+        });
+        if (!r.ok) {
+          lastError = await r.text();
+        } else {
+          deletedCount++;
+          if (
+            drawerSelection?.kind === 'volume' &&
+            drawerSelection.volume.name === vol.name
+          ) {
+            setDrawerSelection(null);
+          }
+        }
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
     }
+
+    if (deletedCount === targetVolumes.length) {
+      updateToast(toastId, `Deleted ${label}`, 'success');
+    } else if (deletedCount > 0) {
+      updateToast(
+        toastId,
+        `Deleted ${deletedCount}/${targetVolumes.length} volumes (${lastError})`,
+        'error'
+      );
+    } else {
+      updateToast(toastId, `Failed to delete ${label}: ${lastError}`, 'error');
+    }
+
+    setSelectedVolumeNames(new Set());
+    await fetchVolumes();
+    await fetchOverview(true);
   };
 
-  const handleDeleteNetwork = async (id: string, name: string) => {
-    try {
-      const r = await fetch(`/api/networks/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      if (!r.ok) throw new Error(await r.text());
-      showToast(`Removed network ${name}`);
-      await fetchNetworks();
-    } catch (err) {
-      showToast(`Failed to remove network: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  const confirmDeleteSingleVolume = (vol: VolumeSummary) => {
+    openConfirmDialog({
+      title: `Delete Volume "${vol.shortName}"?`,
+      description: `This will permanently delete volume "${vol.name}" (${
+        vol.sizeBytes >= 0 ? formatBytes(vol.sizeBytes) : 'unknown size'
+      }${vol.contentHint ? ` · ${vol.contentHint}` : ''}). Any data inside this volume cannot be recovered.`,
+      confirmLabel: 'Delete Volume',
+      onConfirm: () => executeDeleteVolumes([vol]),
+    });
+  };
+
+  const confirmDeleteSelectedVolumes = () => {
+    const targets = volumes.filter((v) => selectedVolumeNames.has(v.name));
+    if (targets.length === 0) return;
+    const totalBytes = targets.reduce(
+      (acc, v) => acc + (v.sizeBytes > 0 ? v.sizeBytes : 0),
+      0
+    );
+    openConfirmDialog({
+      title: `Delete ${targets.length} Selected Volume${targets.length > 1 ? 's' : ''}?`,
+      description: `This will permanently delete ${targets.length} volume${
+        targets.length > 1 ? 's' : ''
+      } (${formatBytes(totalBytes)}) and all data stored inside them.`,
+      confirmLabel: `Delete ${targets.length} Volume${targets.length > 1 ? 's' : ''}`,
+      onConfirm: () => executeDeleteVolumes(targets),
+    });
+  };
+
+  const confirmDeleteNetwork = (net: NetworkSummary) => {
+    openConfirmDialog({
+      title: `Remove Network "${net.name}"?`,
+      description: `This will delete Docker network "${net.name}" (${net.shortId}).`,
+      confirmLabel: 'Remove Network',
+      onConfirm: async () => {
+        const toastId = pushToast(`Removing network ${net.name}...`, 'pending');
+        try {
+          const r = await fetch(`/api/networks/${encodeURIComponent(net.id)}`, {
+            method: 'DELETE',
+          });
+          if (!r.ok) throw new Error(await r.text());
+          updateToast(toastId, `Removed network ${net.name}`, 'success');
+          await fetchNetworks();
+        } catch (err) {
+          updateToast(
+            toastId,
+            `Failed to remove network: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+        }
+      },
+    });
   };
 
   // Filtered Compose Groups & Standalone Containers
@@ -513,6 +810,8 @@ export function App() {
       if (!q) return true;
       return (
         v.name.toLowerCase().includes(q) ||
+        v.shortName.toLowerCase().includes(q) ||
+        (v.contentHint && v.contentHint.toLowerCase().includes(q)) ||
         (v.usedByContainers ?? []).some((c) => c.toLowerCase().includes(q))
       );
     });
@@ -542,12 +841,104 @@ export function App() {
     return total;
   }, [overview, pruneReq]);
 
-  const cpuPct = overview?.host.cpuPercent ?? 0;
-  const memPct = overview?.host.memPercent ?? 0;
+  // =========================================================================
+  // DOCKER SYSTEM VS HOST SYSTEM TELEMETRY CALCULATIONS
+  // =========================================================================
+  const runningContainers = useMemo(
+    () => allContainers.filter((c) => c.state === 'running'),
+    [allContainers]
+  );
+
+  // Sum of CPU % across all running Docker containers (100% = 1 core)
+  const dockerCpuRawPct = useMemo(
+    () => runningContainers.reduce((acc, c) => acc + (c.cpuPercent || 0), 0),
+    [runningContainers]
+  );
+
+  const hostCores = overview?.host.cpuCores || overview?.engine.ncpu || 1;
+  // Normalised to 0..100% of total host CPU capacity
+  const dockerCpuHostPct = Math.min(100, dockerCpuRawPct / hostCores);
+  const hostCpuTotalPct = overview?.host.cpuPercent ?? 0;
+  const otherHostCpuPct = Math.max(0, hostCpuTotalPct - dockerCpuHostPct);
+
+  // Sum of live RAM (excluding page cache) used by all running Docker containers
+  // This is the exact memory freed if all running containers are stopped.
+  const dockerMemBytes = useMemo(
+    () => runningContainers.reduce((acc, c) => acc + (c.memUsageBytes || 0), 0),
+    [runningContainers]
+  );
+  const hostMemTotalBytes = overview?.host.memTotalBytes || 1;
+  const hostMemUsedBytes = overview?.host.memUsedBytes ?? 0;
+  const hostMemTotalPct = overview?.host.memPercent ?? 0;
+  const dockerMemHostPct = Math.min(100, (dockerMemBytes / hostMemTotalBytes) * 100);
+  const otherHostMemPct = Math.max(0, hostMemTotalPct - dockerMemHostPct);
+
+  // Docker disk vs Host root disk
+  const dockerDiskBytes = overview?.diskUsage.totalSize ?? 0;
+  const hostDiskTotalBytes = overview?.host.rootDisk.totalBytes || 1;
+  const hostDiskUsedPct = overview?.host.rootDisk.usedPercent ?? 0;
+  const dockerDiskHostPct = Math.min(100, (dockerDiskBytes / hostDiskTotalBytes) * 100);
+  const otherHostDiskPct = Math.max(0, hostDiskUsedPct - dockerDiskHostPct);
+
   const reclaimableTotal = overview?.diskUsage.totalReclaimable ?? 0;
 
+  // Sorted running containers by RAM usage for the Resources & Prune breakdown
+  const sortedRunningConsumers = useMemo(() => {
+    return [...runningContainers].sort((a, b) => b.memUsageBytes - a.memUsageBytes);
+  }, [runningContainers]);
+
+  const sortedRunningStacks = useMemo(() => {
+    return [...containersData.composeGroups]
+      .filter((g) => g.runningCount > 0)
+      .sort((a, b) => b.memUsageBytes - a.memUsageBytes);
+  }, [containersData.composeGroups]);
+
+  // Multi-select helpers for Images
+  const allFilteredImagesSelected =
+    filteredImages.length > 0 &&
+    filteredImages.every((img) => selectedImageIds.has(img.id));
+
+  const toggleSelectAllImages = () => {
+    if (allFilteredImagesSelected) {
+      setSelectedImageIds(new Set());
+    } else {
+      setSelectedImageIds(new Set(filteredImages.map((img) => img.id)));
+    }
+  };
+
+  const toggleSelectImage = (id: string) => {
+    setSelectedImageIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // Multi-select helpers for Volumes
+  const allFilteredVolumesSelected =
+    filteredVolumes.length > 0 &&
+    filteredVolumes.every((v) => selectedVolumeNames.has(v.name));
+
+  const toggleSelectAllVolumes = () => {
+    if (allFilteredVolumesSelected) {
+      setSelectedVolumeNames(new Set());
+    } else {
+      setSelectedVolumeNames(new Set(filteredVolumes.map((v) => v.name)));
+    }
+  };
+
+  const toggleSelectVolume = (name: string) => {
+    setSelectedVolumeNames((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-[var(--bg-canvas)] text-[var(--text-main)] select-none">
+    <div className="flex flex-col h-screen overflow-hidden bg-[var(--bg-canvas)] text-[var(--text-main)]">
       {/* ================================================================= */}
       {/* TOP HOST & DOCKER TELEMETRY BAR                                   */}
       {/* ================================================================= */}
@@ -578,44 +969,57 @@ export function App() {
           </div>
         </div>
 
-        {/* Live Telemetry Strip + Theme Override */}
+        {/* Live Telemetry Strip (Docker portion vs Host system) + Theme Override */}
         <div className="flex flex-wrap items-center gap-4 text-xs">
-          {toastMessage && (
-            <div className="px-2.5 py-1 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-400 font-mono text-xs">
-              {toastMessage}
-            </div>
-          )}
-
+          {/* CPU: Docker vs Host */}
           <div
             className="flex items-center gap-2 font-mono tabular-nums"
-            title={overview?.host.cpuModel || 'Host CPU'}
+            title={`Docker Containers: ${dockerCpuRawPct.toFixed(1)}% (${dockerCpuHostPct.toFixed(1)}% of ${hostCores} cores) · Total Host CPU: ${hostCpuTotalPct.toFixed(1)}%`}
           >
             <span className="text-[var(--text-muted)] font-sans font-medium">CPU</span>
-            <div className="w-16 h-1.5 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)]">
+            <div className="w-20 h-2 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)] flex">
               <div
                 className="h-full bg-emerald-500 transition-all"
-                style={{ width: `${Math.min(100, cpuPct)}%` }}
+                style={{ width: `${dockerCpuHostPct}%` }}
+                title={`Docker: ${dockerCpuHostPct.toFixed(1)}%`}
+              />
+              <div
+                className="h-full bg-slate-500/50 transition-all"
+                style={{ width: `${otherHostCpuPct}%` }}
+                title={`Rest of Host: ${otherHostCpuPct.toFixed(1)}%`}
               />
             </div>
-            <span>{cpuPct.toFixed(0)}%</span>
-            {overview?.host.cpuTempC !== undefined && (
-              <span className="text-[var(--text-muted)]">
-                ({overview.host.cpuTempC.toFixed(0)}°C)
-              </span>
-            )}
+            <span className="text-emerald-400 font-semibold">
+              {dockerCpuRawPct.toFixed(1)}%
+            </span>
+            <span className="text-[var(--text-muted)]">
+              / {hostCpuTotalPct.toFixed(0)}% host
+            </span>
           </div>
 
-          <div className="flex items-center gap-2 font-mono tabular-nums">
+          {/* RAM: Docker vs Host */}
+          <div
+            className="flex items-center gap-2 font-mono tabular-nums"
+            title={`Docker Containers RAM: ${formatBytes(dockerMemBytes)} (freed if stopped) · Total Host RAM Used: ${formatBytes(hostMemUsedBytes)} / ${formatBytes(hostMemTotalBytes)}`}
+          >
             <span className="text-[var(--text-muted)] font-sans font-medium">RAM</span>
-            <div className="w-16 h-1.5 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)]">
+            <div className="w-20 h-2 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)] flex">
               <div
                 className="h-full bg-sky-500 transition-all"
-                style={{ width: `${Math.min(100, memPct)}%` }}
+                style={{ width: `${dockerMemHostPct}%` }}
+                title={`Docker Containers: ${formatBytes(dockerMemBytes)}`}
+              />
+              <div
+                className="h-full bg-slate-500/50 transition-all"
+                style={{ width: `${otherHostMemPct}%` }}
+                title="Rest of Host System"
               />
             </div>
-            <span>
-              {formatBytes(overview?.host.memUsedBytes, 1)} /{' '}
-              {formatBytes(overview?.host.memTotalBytes, 0)}
+            <span className="text-sky-400 font-semibold">
+              {formatBytes(dockerMemBytes, 1)}
+            </span>
+            <span className="text-[var(--text-muted)]">
+              / {formatBytes(hostMemUsedBytes, 1)} host
             </span>
           </div>
 
@@ -880,6 +1284,7 @@ export function App() {
                                 : null
                             }
                             compact={!!drawerSelection}
+                            pendingActions={pendingActions}
                             onToggleCollapse={() =>
                               setCollapsedStacks((prev) => ({
                                 ...prev,
@@ -906,7 +1311,7 @@ export function App() {
                         <>
                           <tr className="bg-[var(--bg-sidebar)]/60 text-[var(--text-muted)]">
                             <td
-                              colSpan={drawerSelection ? 6 : 7}
+                              colSpan={drawerSelection ? 5 : 7}
                               className="py-1.5 px-3 font-mono text-xs font-semibold"
                             >
                               Standalone Containers ({filteredStandalone.length})
@@ -918,6 +1323,7 @@ export function App() {
                               ctr={ctr}
                               indented={false}
                               compact={!!drawerSelection}
+                              pendingAction={pendingActions[`ctr:${ctr.id}`]}
                               isSelected={
                                 drawerSelection?.kind === 'container' &&
                                 drawerSelection.container.id === ctr.id
@@ -939,7 +1345,7 @@ export function App() {
                         filteredStandalone.length === 0 && (
                           <tr>
                             <td
-                              colSpan={drawerSelection ? 6 : 7}
+                              colSpan={drawerSelection ? 5 : 7}
                               className="py-12 text-center text-[var(--text-muted)] font-mono"
                             >
                               No containers match the current filter.
@@ -964,6 +1370,10 @@ export function App() {
                         initialTab: tab,
                       })
                     }
+                    onDeleteVolume={(volName) => {
+                      const v = volumes.find((item) => item.name === volName);
+                      if (v) confirmDeleteSingleVolume(v);
+                    }}
                   />
                 )}
               </div>
@@ -971,7 +1381,7 @@ export function App() {
           )}
 
           {/* ------------------------------------------------------------- */}
-          {/* VIEW 2: IMAGES                                                */}
+          {/* VIEW 2: IMAGES (WITH CHECKBOX MULTI-SELECT & CONFIRM DELETE)  */}
           {/* ------------------------------------------------------------- */}
           {activeView === 'images' && (
             <div className="flex-1 flex flex-col min-h-0 p-4 space-y-3 overflow-hidden">
@@ -1012,6 +1422,16 @@ export function App() {
                 </div>
 
                 <div className="flex items-center gap-2 text-xs">
+                  {selectedImageIds.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={confirmDeleteSelectedImages}
+                      className="px-3 py-1.5 rounded-md bg-rose-600 text-white font-semibold inline-flex items-center gap-1.5 shadow-sm hover:bg-rose-500"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Delete Selected ({selectedImageIds.size})</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => {
@@ -1051,6 +1471,14 @@ export function App() {
                 <table className="text-left text-xs font-mono tabular-nums">
                   <thead>
                     <tr className="border-b border-[var(--border-subtle)] text-[var(--text-muted)] font-sans">
+                      <th className="py-2 px-3 w-8">
+                        <input
+                          type="checkbox"
+                          aria-label="Select all visible images"
+                          checked={allFilteredImagesSelected}
+                          onChange={toggleSelectAllImages}
+                        />
+                      </th>
                       <th className="py-2 px-3 font-medium">Repository</th>
                       <th className="py-2 px-3 font-medium">Tag</th>
                       <th className="py-2 px-3 font-medium">Image ID</th>
@@ -1061,43 +1489,68 @@ export function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[var(--border-subtle)]">
-                    {filteredImages.map((img) => (
-                      <tr key={img.id} className="hover:bg-[var(--bg-elevated)]/40">
-                        <td className="py-2 px-3 font-semibold">{img.repository}</td>
-                        <td className="py-2 px-3 text-sky-400">{img.tag}</td>
-                        <td className="py-2 px-3 text-[var(--text-muted)]">
-                          {img.shortId}
-                        </td>
-                        <td className="py-2 px-3">
-                          {img.inUse ? (
-                            <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400">
-                              In Use (
-                              {(img.usedByContainers ?? []).slice(0, 2).join(', ') ||
-                                img.containers}
-                              )
-                            </span>
-                          ) : (
-                            <span className="px-1.5 py-0.5 rounded bg-zinc-500/20 text-[var(--text-muted)]">
-                              Unused
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-2 px-3 text-[var(--text-muted)]">
-                          {formatRelativeEpoch(img.created)}
-                        </td>
-                        <td className="py-2 px-3">{formatBytes(img.sizeBytes)}</td>
-                        <td className="py-2 px-3 text-right">
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteImage(img.id, img.inUse)}
-                            className="px-2 py-0.5 rounded border border-rose-500/40 text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1 font-sans"
+                    {filteredImages.map((img) => {
+                      const isChecked = selectedImageIds.has(img.id);
+                      return (
+                        <tr
+                          key={img.id}
+                          onClick={() => toggleSelectImage(img.id)}
+                          className={`cursor-pointer transition ${
+                            isChecked
+                              ? 'bg-sky-500/10'
+                              : 'hover:bg-[var(--bg-elevated)]/40'
+                          }`}
+                        >
+                          <td
+                            className="py-2 px-3"
+                            onClick={(e) => e.stopPropagation()}
                           >
-                            <Trash2 className="w-3 h-3" />
-                            <span>Delete</span>
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                            <input
+                              type="checkbox"
+                              aria-label={`Select image ${img.repository}:${img.tag}`}
+                              checked={isChecked}
+                              onChange={() => toggleSelectImage(img.id)}
+                            />
+                          </td>
+                          <td className="py-2 px-3 font-semibold">{img.repository}</td>
+                          <td className="py-2 px-3 text-sky-400">{img.tag}</td>
+                          <td className="py-2 px-3 text-[var(--text-muted)]">
+                            {img.shortId}
+                          </td>
+                          <td className="py-2 px-3">
+                            {img.inUse ? (
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400">
+                                In Use (
+                                {(img.usedByContainers ?? []).slice(0, 2).join(', ') ||
+                                  img.containers}
+                                )
+                              </span>
+                            ) : (
+                              <span className="px-1.5 py-0.5 rounded bg-zinc-500/20 text-[var(--text-muted)]">
+                                Unused
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-[var(--text-muted)]">
+                            {formatRelativeEpoch(img.created)}
+                          </td>
+                          <td className="py-2 px-3">{formatBytes(img.sizeBytes)}</td>
+                          <td
+                            className="py-2 px-3 text-right"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => confirmDeleteSingleImage(img)}
+                              className="px-2 py-0.5 rounded border border-rose-500/40 text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1 font-sans"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                              <span>Delete</span>
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1105,11 +1558,11 @@ export function App() {
           )}
 
           {/* ------------------------------------------------------------- */}
-          {/* VIEW 3: VOLUMES                                               */}
+          {/* VIEW 3: VOLUMES (PROVENANCE, CONTENT HINTS, DRAWER INSPECTOR) */}
           {/* ------------------------------------------------------------- */}
           {activeView === 'volumes' && (
-            <div className="flex-1 flex flex-col min-h-0 p-4 space-y-3 overflow-hidden">
-              <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-card)] flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <div className="relative">
                     <Search className="w-3.5 h-3.5 text-[var(--text-muted)] absolute left-2.5 top-2" />
@@ -1117,11 +1570,11 @@ export function App() {
                       type="search"
                       value={volumeQuery}
                       onChange={(e) => setVolumeQuery(e.target.value)}
-                      placeholder="Filter volumes by name or attached container..."
-                      className="pl-8 pr-3 py-1 rounded-md bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs w-72 font-mono focus:outline-none"
+                      placeholder="Filter volumes by name, content hint (e.g. Postgres, RabbitMQ), or container..."
+                      className="pl-8 pr-3 py-1 rounded-md bg-[var(--bg-canvas)] border border-[var(--border-subtle)] text-xs w-80 font-mono focus:outline-none"
                     />
                   </div>
-                  <div className="flex items-center rounded-md border border-[var(--border-subtle)] bg-[var(--bg-card)] p-0.5 text-xs">
+                  <div className="flex items-center rounded-md border border-[var(--border-subtle)] bg-[var(--bg-canvas)] p-0.5 text-xs">
                     {(
                       [
                         ['all', `All (${volumes.length})`],
@@ -1138,7 +1591,7 @@ export function App() {
                         onClick={() => setVolumeFilter(key)}
                         className={`px-2.5 py-0.5 rounded font-medium ${
                           volumeFilter === key
-                            ? 'bg-[var(--bg-elevated)] text-[var(--text-main)]'
+                            ? 'bg-[var(--bg-card)] text-[var(--text-main)] shadow-sm'
                             : 'text-[var(--text-muted)]'
                         }`}
                       >
@@ -1149,6 +1602,16 @@ export function App() {
                 </div>
 
                 <div className="flex items-center gap-2 text-xs">
+                  {selectedVolumeNames.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={confirmDeleteSelectedVolumes}
+                      className="px-3 py-1.5 rounded-md bg-rose-600 text-white font-semibold inline-flex items-center gap-1.5 shadow-sm hover:bg-rose-500"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Delete Selected ({selectedVolumeNames.size})</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => createVolumeDialogRef.current?.showModal()}
@@ -1168,57 +1631,202 @@ export function App() {
                 </div>
               </div>
 
-              <div
-                tabIndex={0}
-                role="region"
-                aria-label="Docker volumes"
-                className="table-wrapper flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-card)]"
-              >
-                <table className="text-left text-xs font-mono tabular-nums">
-                  <thead>
-                    <tr className="border-b border-[var(--border-subtle)] text-[var(--text-muted)] font-sans">
-                      <th className="py-2 px-3 font-medium">Volume Name</th>
-                      <th className="py-2 px-3 font-medium">Driver</th>
-                      <th className="py-2 px-3 font-medium">Attached Containers</th>
-                      <th className="py-2 px-3 font-medium">Size</th>
-                      <th className="py-2 px-3 font-medium text-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[var(--border-subtle)]">
-                    {filteredVolumes.map((vol) => (
-                      <tr key={vol.name} className="hover:bg-[var(--bg-elevated)]/40">
-                        <td className="py-2 px-3 font-semibold">{vol.name}</td>
-                        <td className="py-2 px-3 text-[var(--text-muted)]">
-                          {vol.driver}
-                        </td>
-                        <td className="py-2 px-3">
-                          {vol.inUse ? (
-                            <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400">
-                              {(vol.usedByContainers ?? []).join(', ')}
-                            </span>
-                          ) : (
-                            <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400">
-                              Unattached
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-2 px-3">
-                          {vol.sizeBytes >= 0 ? formatBytes(vol.sizeBytes) : '—'}
-                        </td>
-                        <td className="py-2 px-3 text-right">
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteVolume(vol.name)}
-                            className="px-2 py-0.5 rounded border border-rose-500/40 text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1 font-sans"
-                          >
-                            <Trash2 className="w-3 h-3" />
-                            <span>Delete</span>
-                          </button>
-                        </td>
+              <div className="flex-1 flex flex-row min-h-0 overflow-hidden">
+                <div
+                  tabIndex={0}
+                  role="region"
+                  aria-label="Docker volumes"
+                  className={`table-wrapper flex-1 min-h-0 bg-[var(--bg-card)] ${
+                    drawerSelection?.kind === 'volume' ? 'w-1/2' : 'w-full'
+                  }`}
+                >
+                  <table className="text-left text-xs font-mono tabular-nums">
+                    <thead>
+                      <tr className="border-b border-[var(--border-subtle)] text-[var(--text-muted)] font-sans">
+                        <th className="py-2 px-3 w-8">
+                          <input
+                            type="checkbox"
+                            aria-label="Select all visible volumes"
+                            checked={allFilteredVolumesSelected}
+                            onChange={toggleSelectAllVolumes}
+                          />
+                        </th>
+                        <th className="py-2 px-3 font-medium">Volume / Type</th>
+                        <th className="py-2 px-3 font-medium">
+                          Inferred Contents / What It Was Used For
+                        </th>
+                        {drawerSelection?.kind !== 'volume' && (
+                          <th className="py-2 px-3 font-medium">Container Mounts</th>
+                        )}
+                        {drawerSelection?.kind !== 'volume' && (
+                          <th className="py-2 px-3 font-medium">Created</th>
+                        )}
+                        <th className="py-2 px-3 font-medium">Size</th>
+                        {drawerSelection?.kind !== 'volume' && (
+                          <th className="py-2 px-3 font-medium text-right">Actions</th>
+                        )}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody className="divide-y divide-[var(--border-subtle)]">
+                      {filteredVolumes.map((vol) => {
+                        const isChecked = selectedVolumeNames.has(vol.name);
+                        const isSelectedDrawer =
+                          drawerSelection?.kind === 'volume' &&
+                          drawerSelection.volume.name === vol.name;
+
+                        return (
+                          <tr
+                            key={vol.name}
+                            onClick={() =>
+                              setDrawerSelection({ kind: 'volume', volume: vol })
+                            }
+                            className={`cursor-pointer transition ${
+                              isSelectedDrawer
+                                ? 'bg-[var(--bg-elevated)] border-l-2 border-l-purple-400'
+                                : isChecked
+                                  ? 'bg-sky-500/10'
+                                  : 'hover:bg-[var(--bg-elevated)]/40'
+                            }`}
+                          >
+                            <td
+                              className="py-2 px-3"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <input
+                                type="checkbox"
+                                aria-label={`Select volume ${vol.shortName}`}
+                                checked={isChecked}
+                                onChange={() => toggleSelectVolume(vol.name)}
+                              />
+                            </td>
+                            <td className="py-2 px-3">
+                              <div className="flex items-center gap-2 whitespace-nowrap">
+                                <span
+                                  className="font-semibold"
+                                  title={vol.name}
+                                >
+                                  {vol.shortName}
+                                </span>
+                                {vol.anonymous ? (
+                                  <span
+                                    className="px-1.5 py-0.5 rounded bg-zinc-500/20 text-[var(--text-muted)] text-[11px] font-sans"
+                                    title="Anonymous Docker volume (64-char hash created by a container VOLUME instruction)"
+                                  >
+                                    Anon
+                                  </span>
+                                ) : vol.composeProject ? (
+                                  <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-400 text-[11px] font-sans">
+                                    Stack: {vol.composeProject}
+                                  </span>
+                                ) : (
+                                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[11px] font-sans">
+                                    Named
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="py-2 px-3">
+                              <div className="flex flex-col gap-0.5">
+                                <span
+                                  className={
+                                    vol.contentHint === 'Empty volume'
+                                      ? 'text-[var(--text-muted)]'
+                                      : 'text-purple-400 font-semibold font-sans'
+                                  }
+                                >
+                                  {vol.contentHint || 'Inspecting...'}
+                                </span>
+                                {vol.topEntries && vol.topEntries.length > 0 && (
+                                  <span className="text-[11px] text-[var(--text-muted)] truncate max-w-[14rem]">
+                                    /{vol.topEntries.slice(0, 4).join(', /')}
+                                    {vol.topEntries.length > 4 ? ', ...' : ''}
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            {drawerSelection?.kind !== 'volume' && (
+                              <td className="py-2 px-3">
+                                {vol.inUse ? (
+                                  <div className="flex flex-col gap-0.5">
+                                    {(vol.mountPaths && vol.mountPaths.length > 0
+                                      ? vol.mountPaths
+                                      : vol.usedByContainers ?? []
+                                    ).map((mp) => (
+                                      <span
+                                        key={mp}
+                                        className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 inline-block w-fit truncate max-w-[13rem]"
+                                        title={mp}
+                                      >
+                                        {mp}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400">
+                                    Unattached
+                                  </span>
+                                )}
+                              </td>
+                            )}
+                            {drawerSelection?.kind !== 'volume' && (
+                              <td className="py-2 px-3 text-[var(--text-muted)]">
+                                {formatRelativeTime(vol.createdAt)}
+                              </td>
+                            )}
+                            <td className="py-2 px-3 whitespace-nowrap">
+                              {vol.sizeBytes >= 0 ? formatBytes(vol.sizeBytes) : '—'}
+                            </td>
+                            {drawerSelection?.kind !== 'volume' && (
+                              <td
+                                className="py-2 px-3 text-right space-x-1 whitespace-nowrap"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setDrawerSelection({ kind: 'volume', volume: vol })
+                                  }
+                                  className="px-2 py-0.5 rounded border border-[var(--border-subtle)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-elevated)] font-sans"
+                                >
+                                  Inspect
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => confirmDeleteSingleVolume(vol)}
+                                  className="px-2 py-0.5 rounded border border-rose-500/40 text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1 font-sans"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  <span>Delete</span>
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {drawerSelection?.kind === 'volume' && (
+                  <RightDrawer
+                    selection={drawerSelection}
+                    onClose={() => setDrawerSelection(null)}
+                    onContainerAction={handleContainerAction}
+                    onComposeAction={handleComposeAction}
+                    onSelectContainer={(ctr, tab) => {
+                      setActiveView('containers');
+                      setDrawerSelection({
+                        kind: 'container',
+                        container: ctr,
+                        initialTab: tab,
+                      });
+                    }}
+                    onDeleteVolume={(volName) => {
+                      const v = volumes.find((item) => item.name === volName);
+                      if (v) confirmDeleteSingleVolume(v);
+                    }}
+                  />
+                )}
               </div>
             </div>
           )}
@@ -1292,7 +1900,7 @@ export function App() {
                           {!net.builtIn && (
                             <button
                               type="button"
-                              onClick={() => handleDeleteNetwork(net.id, net.name)}
+                              onClick={() => confirmDeleteNetwork(net)}
                               className="px-2 py-0.5 rounded border border-rose-500/40 text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1 font-sans"
                             >
                               <Trash2 className="w-3 h-3" />
@@ -1309,138 +1917,363 @@ export function App() {
           )}
 
           {/* ------------------------------------------------------------- */}
-          {/* VIEW 5: RESOURCES & PRUNE CENTRE                              */}
+          {/* VIEW 5: RESOURCES & PRUNE CENTRE (DOCKER VS HOST + CONSUMERS) */}
           {/* ------------------------------------------------------------- */}
           {activeView === 'resources' && (
             <div className="flex-1 p-4 space-y-4 overflow-auto">
-              {/* Host Telemetry Section */}
+              {/* Row 1: Docker System vs Host System (Dual-Colour Stacked Bars) */}
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs">
-                {/* CPU Card */}
+                {/* 1. CPU: Docker Share vs Host System */}
                 <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2.5">
                   <div className="flex items-center justify-between">
                     <span className="font-semibold inline-flex items-center gap-1.5">
                       <Cpu className="w-4 h-4 text-emerald-400" />
-                      <span>Host CPU ({overview?.host.cpuCores ?? 0} cores)</span>
+                      <span>CPU: Docker vs Host ({hostCores} cores)</span>
                     </span>
                     <span className="font-mono text-sm font-semibold text-emerald-400">
-                      {cpuPct.toFixed(1)}%
+                      {dockerCpuRawPct.toFixed(1)}% Docker
                     </span>
                   </div>
-                  <div className="text-[var(--text-muted)] font-mono truncate">
-                    {overview?.host.cpuModel || 'Linux CPU'} · Kernel{' '}
-                    {overview?.host.kernelVersion}
+
+                  {/* Dual-colour stacked progress bar */}
+                  <div className="w-full h-3 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)] flex">
+                    <div
+                      className="h-full bg-emerald-500 transition-all"
+                      style={{ width: `${dockerCpuHostPct}%` }}
+                      title={`Docker Containers: ${dockerCpuHostPct.toFixed(1)}% of host CPU`}
+                    />
+                    <div
+                      className="h-full bg-slate-500/45 transition-all"
+                      style={{ width: `${otherHostCpuPct}%` }}
+                      title={`Other Host Processes: ${otherHostCpuPct.toFixed(1)}% of host CPU`}
+                    />
                   </div>
-                  {overview?.host.perCore && overview.host.perCore.length > 0 && (
-                    <div className="grid grid-cols-4 gap-1.5 pt-1">
-                      {overview.host.perCore.map((core) => (
-                        <div
-                          key={core.core}
-                          className="p-1 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono"
-                        >
-                          <div className="flex justify-between text-xs">
-                            <span className="text-[var(--text-muted)]">{core.core}</span>
-                            <span>{core.percent.toFixed(0)}%</span>
-                          </div>
-                          <div className="w-full h-1 bg-[var(--bg-sidebar)] rounded-full mt-1 overflow-hidden">
-                            <div
-                              className="h-full bg-emerald-500"
-                              style={{ width: `${Math.min(100, core.percent)}%` }}
-                            />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+
+                  <div className="flex items-center justify-between font-mono text-[11px]">
+                    <span className="inline-flex items-center gap-1.5 text-emerald-400 font-semibold">
+                      <span className="w-2.5 h-2.5 rounded-sm bg-emerald-500 inline-block" />
+                      Docker: {dockerCpuHostPct.toFixed(1)}% host ({dockerCpuRawPct.toFixed(1)}% raw)
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+                      <span className="w-2.5 h-2.5 rounded-sm bg-slate-500/60 inline-block" />
+                      Other Host: {otherHostCpuPct.toFixed(1)}%
+                    </span>
+                  </div>
+
+                  <div className="pt-1 border-t border-[var(--border-subtle)] flex justify-between font-mono text-[var(--text-muted)]">
+                    <span className="truncate max-w-[14rem]">
+                      {overview?.host.cpuModel || 'Linux CPU'}
+                    </span>
+                    <span>Total Host CPU: {hostCpuTotalPct.toFixed(1)}%</span>
+                  </div>
                 </div>
 
-                {/* Memory & Swap Card */}
+                {/* 2. Memory: Docker Containers RAM (Reclaimable by Stopping) vs Host RAM */}
                 <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2.5">
                   <div className="flex items-center justify-between">
                     <span className="font-semibold inline-flex items-center gap-1.5">
                       <Activity className="w-4 h-4 text-sky-400" />
-                      <span>Host Memory &amp; Swap</span>
+                      <span>Memory: Docker vs Host RAM</span>
                     </span>
                     <span className="font-mono text-sm font-semibold text-sky-400">
-                      {memPct.toFixed(1)}%
+                      {formatBytes(dockerMemBytes)} Docker
                     </span>
                   </div>
-                  <div className="w-full h-2.5 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)]">
+
+                  {/* Dual-colour stacked progress bar */}
+                  <div className="w-full h-3 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)] flex">
                     <div
-                      className="h-full bg-sky-500"
-                      style={{ width: `${Math.min(100, memPct)}%` }}
+                      className="h-full bg-sky-500 transition-all"
+                      style={{ width: `${dockerMemHostPct}%` }}
+                      title={`Docker Containers: ${formatBytes(dockerMemBytes)} (${dockerMemHostPct.toFixed(1)}%)`}
+                    />
+                    <div
+                      className="h-full bg-slate-500/45 transition-all"
+                      style={{ width: `${otherHostMemPct}%` }}
+                      title={`Other Host RAM: ${otherHostMemPct.toFixed(1)}%`}
                     />
                   </div>
-                  <div className="grid grid-cols-2 gap-2 font-mono pt-1">
+
+                  <div className="flex items-center justify-between font-mono text-[11px]">
+                    <span className="inline-flex items-center gap-1.5 text-sky-400 font-semibold">
+                      <span className="w-2.5 h-2.5 rounded-sm bg-sky-500 inline-block" />
+                      Docker: {formatBytes(dockerMemBytes)} ({dockerMemHostPct.toFixed(1)}%)
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+                      <span className="w-2.5 h-2.5 rounded-sm bg-slate-500/60 inline-block" />
+                      Other Host:{' '}
+                      {formatBytes(Math.max(0, hostMemUsedBytes - dockerMemBytes))}
+                    </span>
+                  </div>
+
+                  <div className="p-2 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-between">
                     <div>
-                      <span className="text-[var(--text-muted)] block">Used</span>
-                      <span>{formatBytes(overview?.host.memUsedBytes)}</span>
+                      <div className="font-semibold text-sky-400">
+                        Reclaimable RAM if Containers Stopped
+                      </div>
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                         across {runningContainers.length} running container
+                        {runningContainers.length === 1 ? '' : 's'}
+                      </div>
                     </div>
-                    <div>
-                      <span className="text-[var(--text-muted)] block">Available</span>
-                      <span>{formatBytes(overview?.host.memAvailBytes)}</span>
-                    </div>
-                    <div>
-                      <span className="text-[var(--text-muted)] block">Page Cache</span>
-                      <span>{formatBytes(overview?.host.memCacheBytes)}</span>
-                    </div>
-                    <div>
-                      <span className="text-[var(--text-muted)] block">Swap Used</span>
-                      <span>
-                        {formatBytes(overview?.host.swapUsedBytes)} /{' '}
-                        {formatBytes(overview?.host.swapTotalBytes)}
-                      </span>
+                    <div className="font-mono text-sm font-bold text-sky-400">
+                      {formatBytes(dockerMemBytes)}
                     </div>
                   </div>
                 </div>
 
-                {/* Filesystems Card */}
+                {/* 3. Disk Storage: Docker Footprint vs Host Filesystem */}
                 <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2.5">
                   <div className="flex items-center justify-between">
                     <span className="font-semibold inline-flex items-center gap-1.5">
                       <HardDrive className="w-4 h-4 text-purple-400" />
-                      <span>Linux Filesystems</span>
+                      <span>Disk: Docker vs Host ({overview?.engine.storageDriver || 'overlay2'})</span>
                     </span>
-                    <span className="font-mono text-xs text-[var(--text-muted)]">
-                      {overview?.engine.storageDriver || 'overlay2'}
+                    <span className="font-mono text-sm font-semibold text-purple-400">
+                      {formatBytes(dockerDiskBytes)} Docker
                     </span>
                   </div>
-                  <div className="space-y-2 font-mono">
+
+                  {/* Dual-colour stacked progress bar */}
+                  <div className="w-full h-3 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)] flex">
+                    <div
+                      className="h-full bg-purple-500 transition-all"
+                      style={{ width: `${dockerDiskHostPct}%` }}
+                      title={`Docker Engine Storage: ${formatBytes(dockerDiskBytes)} (${dockerDiskHostPct.toFixed(1)}%)`}
+                    />
+                    <div
+                      className="h-full bg-slate-500/45 transition-all"
+                      style={{ width: `${otherHostDiskPct}%` }}
+                      title={`Other Host Files: ${otherHostDiskPct.toFixed(1)}%`}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between font-mono text-[11px]">
+                    <span className="inline-flex items-center gap-1.5 text-purple-400 font-semibold">
+                      <span className="w-2.5 h-2.5 rounded-sm bg-purple-500 inline-block" />
+                      Docker: {formatBytes(dockerDiskBytes)} ({dockerDiskHostPct.toFixed(1)}%)
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+                      <span className="w-2.5 h-2.5 rounded-sm bg-slate-500/60 inline-block" />
+                      Host Disk: {formatBytes(overview?.host.rootDisk.usedBytes)} /{' '}
+                      {formatBytes(overview?.host.rootDisk.totalBytes)}
+                    </span>
+                  </div>
+
+                  <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-between">
                     <div>
-                      <div className="flex justify-between">
-                        <span>Root (/)</span>
-                        <span>
-                          {formatBytes(overview?.host.rootDisk.usedBytes)} /{' '}
-                          {formatBytes(overview?.host.rootDisk.totalBytes)} (
-                          {overview?.host.rootDisk.usedPercent.toFixed(1)}%)
-                        </span>
+                      <div className="font-semibold text-emerald-400">
+                        Reclaimable Disk by Pruning Unused Objects
                       </div>
-                      <div className="w-full h-2 bg-[var(--bg-sidebar)] rounded-full mt-1 overflow-hidden border border-[var(--border-subtle)]">
-                        <div
-                          className="h-full bg-purple-500"
-                          style={{
-                            width: `${Math.min(
-                              100,
-                              overview?.host.rootDisk.usedPercent ?? 0
-                            )}%`,
-                          }}
-                        />
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                        {formatBytes(overview?.diskUsage.safeReclaimable)} safe +{' '}
+                        {formatBytes(overview?.diskUsage.volumesReclaimable)} unattached volumes
                       </div>
                     </div>
-                    <div>
-                      <div className="flex justify-between">
-                        <span className="truncate max-w-[10rem]">
-                          Docker ({overview?.host.dockerDisk.path})
-                        </span>
-                        <span>
-                          {formatBytes(overview?.diskUsage.totalSize)} Docker Objects
-                        </span>
-                      </div>
+                    <div className="font-mono text-sm font-bold text-emerald-400">
+                      {formatBytes(reclaimableTotal)}
                     </div>
                   </div>
                 </div>
               </div>
 
-              {/* Docker Disk Breakdown (/system/df) */}
+              {/* Row 2: Per-Stack & Per-Container Live Resource Consumption Breakdown */}
+              <div className="p-4 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold">
+                      Consumption by Running Compose Stack &amp; Container
+                    </h3>
+                    <p className="text-[var(--text-muted)]">
+                      Live memory and CPU consumed by each active Compose stack and container,
+                      ranked by RAM usage. Stopping a stack or container immediately frees its
+                      memory back to the host.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3 font-mono">
+                    <div className="px-2.5 py-1 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)]">
+                      <span className="text-[var(--text-muted)]">Total Docker CPU: </span>
+                      <span className="text-emerald-400 font-semibold">
+                        {dockerCpuRawPct.toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="px-2.5 py-1 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)]">
+                      <span className="text-[var(--text-muted)]">Total Docker RAM: </span>
+                      <span className="text-sky-400 font-semibold">
+                        {formatBytes(dockerMemBytes)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Active Compose Stacks Summary Strip */}
+                {sortedRunningStacks.length > 0 && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                    {sortedRunningStacks.map((stack) => {
+                      const stackMemShare =
+                        dockerMemBytes > 0
+                          ? (stack.memUsageBytes / dockerMemBytes) * 100
+                          : 0;
+                      const pending = pendingActions[`stack:${stack.name}`];
+                      return (
+                        <div
+                          key={stack.name}
+                          className="p-3 rounded-lg bg-[var(--bg-canvas)] border border-[var(--border-subtle)] flex items-center justify-between gap-3"
+                        >
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex items-center gap-2 font-mono">
+                              <span className="font-semibold text-sky-400">
+                                📦 {stack.name}
+                              </span>
+                              <span className="text-[var(--text-muted)]">
+                                ({stack.runningCount} running)
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-3 font-mono text-xs">
+                              <span className="text-emerald-400">
+                                CPU {stack.cpuPercent.toFixed(1)}%
+                              </span>
+                              <span className="text-sky-400 font-semibold">
+                                RAM {formatBytes(stack.memUsageBytes)} (
+                                {stackMemShare.toFixed(0)}% of Docker RAM)
+                              </span>
+                            </div>
+                            <div className="w-full h-1.5 bg-[var(--bg-sidebar)] rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-sky-500"
+                                style={{ width: `${Math.min(100, stackMemShare)}%` }}
+                              />
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!!pending}
+                            onClick={() => handleComposeAction(stack.name, 'stop')}
+                            className="px-2.5 py-1.5 rounded-md border border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 font-mono text-xs shrink-0 inline-flex items-center gap-1.5 disabled:opacity-50"
+                          >
+                            {pending ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Square className="w-3 h-3" />
+                            )}
+                            <span>
+                              {pending
+                                ? 'Stopping...'
+                                : `Stop Stack (Free ${formatBytes(stack.memUsageBytes, 0)})`}
+                            </span>
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Per-Container Table */}
+                <div className="table-wrapper rounded-lg border border-[var(--border-subtle)]">
+                  <table className="text-left text-xs font-mono tabular-nums">
+                    <thead>
+                      <tr className="border-b border-[var(--border-subtle)] text-[var(--text-muted)] font-sans">
+                        <th className="py-2 px-3 font-medium">Container</th>
+                        <th className="py-2 px-3 font-medium">Stack / Image</th>
+                        <th className="py-2 px-3 font-medium">CPU Usage</th>
+                        <th className="py-2 px-3 font-medium">RAM Used (Freed if Stopped)</th>
+                        <th className="py-2 px-3 font-medium w-44">Share of Docker RAM</th>
+                        <th className="py-2 px-3 font-medium text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[var(--border-subtle)]">
+                      {sortedRunningConsumers.length === 0 ? (
+                        <tr>
+                          <td
+                            colSpan={6}
+                            className="py-6 text-center text-[var(--text-muted)]"
+                          >
+                            No containers are currently running (0 B RAM consumed).
+                          </td>
+                        </tr>
+                      ) : (
+                        sortedRunningConsumers.map((ctr) => {
+                          const sharePct =
+                            dockerMemBytes > 0
+                              ? (ctr.memUsageBytes / dockerMemBytes) * 100
+                              : 0;
+                          const pending = pendingActions[`ctr:${ctr.id}`];
+                          return (
+                            <tr
+                              key={ctr.id}
+                              className="hover:bg-[var(--bg-elevated)]/40"
+                            >
+                              <td className="py-2 px-3 font-semibold">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActiveView('containers');
+                                    setDrawerSelection({
+                                      kind: 'container',
+                                      container: ctr,
+                                      initialTab: 'stats',
+                                    });
+                                  }}
+                                  className="text-left hover:underline text-sky-400"
+                                >
+                                  {ctr.name}
+                                </button>
+                              </td>
+                              <td className="py-2 px-3 text-[var(--text-muted)]">
+                                {ctr.composeProject ? (
+                                  <span className="text-sky-400">{ctr.composeProject}</span>
+                                ) : (
+                                  ctr.image
+                                )}
+                              </td>
+                              <td className="py-2 px-3 text-emerald-400">
+                                {ctr.cpuPercent.toFixed(1)}%
+                              </td>
+                              <td className="py-2 px-3 font-semibold text-sky-400">
+                                {formatBytes(ctr.memUsageBytes)}
+                              </td>
+                              <td className="py-2 px-3">
+                                <div className="flex items-center gap-2">
+                                  <div className="flex-1 h-2 bg-[var(--bg-sidebar)] rounded-full overflow-hidden border border-[var(--border-subtle)]">
+                                    <div
+                                      className="h-full bg-sky-500"
+                                      style={{ width: `${Math.min(100, sharePct)}%` }}
+                                    />
+                                  </div>
+                                  <span className="w-10 text-right text-[var(--text-muted)]">
+                                    {sharePct.toFixed(0)}%
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="py-2 px-3 text-right">
+                                <button
+                                  type="button"
+                                  disabled={!!pending}
+                                  onClick={() => handleContainerAction(ctr.id, 'stop')}
+                                  className="px-2 py-0.5 rounded border border-rose-500/40 text-rose-400 hover:bg-rose-500/10 font-sans inline-flex items-center gap-1 disabled:opacity-50"
+                                >
+                                  {pending ? (
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                  ) : (
+                                    <Square className="w-3 h-3" />
+                                  )}
+                                  <span>
+                                    {pending
+                                      ? 'Stopping...'
+                                      : `Stop (Free ${formatBytes(ctr.memUsageBytes, 0)})`}
+                                  </span>
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Row 3: Docker Disk Breakdown (/system/df) */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
                 <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-1.5">
                   <div className="flex justify-between text-[var(--text-muted)]">
@@ -1453,7 +2286,7 @@ export function App() {
                     {formatBytes(overview?.diskUsage.imagesSize)}
                   </div>
                   <div className="text-emerald-400 font-mono">
-                    {formatBytes(overview?.diskUsage.imagesReclaimable)} reclaimable
+                    {formatBytes(overview?.diskUsage.imagesReclaimable)} reclaimable disk
                   </div>
                 </div>
 
@@ -1467,14 +2300,14 @@ export function App() {
                     {formatBytes(overview?.diskUsage.buildCacheSize)}
                   </div>
                   <div className="text-emerald-400 font-mono">
-                    {formatBytes(overview?.diskUsage.buildCacheReclaimable)} reclaimable
+                    {formatBytes(overview?.diskUsage.buildCacheReclaimable)} reclaimable disk
                   </div>
                 </div>
 
                 <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-1.5">
                   <div className="flex justify-between text-[var(--text-muted)]">
                     <span>
-                      Containers ({overview?.diskUsage.containersActive ?? 0}/
+                      Containers RW Layer ({overview?.diskUsage.containersActive ?? 0}/
                       {overview?.diskUsage.containersTotal ?? 0} running)
                     </span>
                   </div>
@@ -1482,7 +2315,7 @@ export function App() {
                     {formatBytes(overview?.diskUsage.containersSize)}
                   </div>
                   <div className="text-emerald-400 font-mono">
-                    {formatBytes(overview?.diskUsage.containersReclaimable)} reclaimable
+                    {formatBytes(overview?.diskUsage.containersReclaimable)} reclaimable disk
                   </div>
                 </div>
 
@@ -1498,23 +2331,23 @@ export function App() {
                     {formatBytes(overview?.diskUsage.volumesSize)}
                   </div>
                   <div className="text-amber-400 font-mono">
-                    {formatBytes(overview?.diskUsage.volumesReclaimable)} unattached
+                    {formatBytes(overview?.diskUsage.volumesReclaimable)} unattached disk
                   </div>
                 </div>
               </div>
 
-              {/* Safe Prune Builder */}
+              {/* Row 4: Safe Prune Builder */}
               <div className="p-4 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-3 text-xs">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <h3 className="text-sm font-semibold">Docker System Prune Builder</h3>
+                    <h3 className="text-sm font-semibold">Docker Disk Prune Builder</h3>
                     <p className="text-[var(--text-muted)]">
-                      Select which unused Docker resources to clean up. Named volumes are
+                      Select which unused Docker disk objects to clean up. Volumes are
                       excluded by default to protect local databases.
                     </p>
                   </div>
                   <div className="text-right font-mono">
-                    <div className="text-[var(--text-muted)]">Estimated Reclaimable</div>
+                    <div className="text-[var(--text-muted)]">Estimated Disk Reclaimable</div>
                     <div className="text-base font-semibold text-emerald-400">
                       {formatBytes(estimatedPruneBytes)}
                     </div>
@@ -1626,56 +2459,102 @@ export function App() {
       </div>
 
       {/* ================================================================= */}
-      {/* NATIVE MODAL DIALOGS (per modern-web-guidance `dialog`)           */}
+      {/* FLOATING TOAST NOTIFICATIONS (PENDING + COMPLETION FEEDBACK)      */}
+      {/* ================================================================= */}
+      {toasts.length > 0 && (
+        <div
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none"
+        >
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className={`pointer-events-auto flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg border shadow-xl font-mono text-xs ${
+                t.status === 'pending'
+                  ? 'bg-[var(--bg-card)] border-sky-500/50 text-sky-400'
+                  : t.status === 'error'
+                    ? 'bg-[var(--bg-card)] border-rose-500/50 text-rose-400'
+                    : 'bg-[var(--bg-card)] border-emerald-500/50 text-emerald-400'
+              }`}
+            >
+              {t.status === 'pending' && (
+                <Loader2 className="w-4 h-4 animate-spin shrink-0 text-sky-400" />
+              )}
+              {t.status === 'success' && (
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
+              )}
+              {t.status === 'error' && (
+                <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+              )}
+              <span className="truncate">{t.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ================================================================= */}
+      {/* NATIVE MODAL DIALOGS (CENTRED VIA `margin: auto` IN index.css)    */}
       {/* ================================================================= */}
 
-      {/* 1. Pull Image Modal */}
+      {/* 1. Pull Image Modal (Supports Enter Key via <form onSubmit>) */}
       <dialog ref={pullDialogRef} aria-labelledby="pull-dialog-title">
-        <div className="p-4 space-y-3 text-xs">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            startImagePull();
+          }}
+          className="p-4 space-y-3 text-xs"
+        >
           <h2 id="pull-dialog-title" className="text-sm font-semibold">
             Pull Docker Image
           </h2>
           <p className="text-[var(--text-muted)]">
             Enter a registry image reference (for example{' '}
             <code className="font-mono">redis:7-alpine</code> or{' '}
-            <code className="font-mono">postgres:18</code>).
+            <code className="font-mono">postgres:18</code>) and press Enter.
           </p>
           <input
             type="text"
             value={pullImageRef}
             onChange={(e) => setPullImageRef(e.target.value)}
             placeholder="repository:tag"
+            autoFocus
             className="w-full px-3 py-1.5 rounded-md bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono text-xs"
           />
           {pullLogs.length > 0 && (
-            <pre className="p-2.5 rounded-md bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono text-xs max-h-44 overflow-auto">
+            <pre className="p-2.5 rounded-md bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono text-xs max-h-44 overflow-auto select-text">
               {pullLogs.join('\n')}
             </pre>
           )}
           <div className="flex justify-end gap-2 pt-2">
-            <form method="dialog">
-              <button
-                value="cancel"
-                className="px-3 py-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-canvas)]"
-              >
-                Close
-              </button>
-            </form>
             <button
               type="button"
-              disabled={pulling || !pullImageRef.trim()}
-              onClick={startImagePull}
-              className="px-3 py-1.5 rounded-md bg-[var(--accent-primary)] text-[var(--accent-primary-fg)] font-semibold disabled:opacity-50"
+              onClick={() => pullDialogRef.current?.close()}
+              className="px-3 py-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-canvas)]"
             >
-              {pulling ? 'Pulling...' : 'Pull Image'}
+              Close
+            </button>
+            <button
+              type="submit"
+              disabled={pulling || !pullImageRef.trim()}
+              className="px-3 py-1.5 rounded-md bg-[var(--accent-primary)] text-[var(--accent-primary-fg)] font-semibold disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              {pulling && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              <span>{pulling ? 'Pulling...' : 'Pull Image'}</span>
             </button>
           </div>
-        </div>
+        </form>
       </dialog>
 
-      {/* 2. Create Volume Modal */}
+      {/* 2. Create Volume Modal (Supports Enter Key via <form onSubmit>) */}
       <dialog ref={createVolumeDialogRef} aria-labelledby="create-vol-title">
-        <div className="p-4 space-y-3 text-xs">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleCreateVolume();
+          }}
+          className="p-4 space-y-3 text-xs"
+        >
           <h2 id="create-vol-title" className="text-sm font-semibold">
             Create Docker Volume
           </h2>
@@ -1684,26 +2563,26 @@ export function App() {
             value={newVolumeName}
             onChange={(e) => setNewVolumeName(e.target.value)}
             placeholder="my_volume_data"
+            autoFocus
             className="w-full px-3 py-1.5 rounded-md bg-[var(--bg-canvas)] border border-[var(--border-subtle)] font-mono text-xs"
           />
           <div className="flex justify-end gap-2 pt-2">
-            <form method="dialog">
-              <button
-                value="cancel"
-                className="px-3 py-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-canvas)]"
-              >
-                Cancel
-              </button>
-            </form>
             <button
               type="button"
-              onClick={handleCreateVolume}
-              className="px-3 py-1.5 rounded-md bg-[var(--accent-primary)] text-[var(--accent-primary-fg)] font-semibold"
+              onClick={() => createVolumeDialogRef.current?.close()}
+              className="px-3 py-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-canvas)]"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={!newVolumeName.trim()}
+              className="px-3 py-1.5 rounded-md bg-[var(--accent-primary)] text-[var(--accent-primary-fg)] font-semibold disabled:opacity-50"
             >
               Create
             </button>
           </div>
-        </div>
+        </form>
       </dialog>
 
       {/* 3. Destructive Volume Prune Confirmation Modal */}
@@ -1751,6 +2630,47 @@ export function App() {
           </form>
         </div>
       </dialog>
+
+      {/* 4. Generic Delete Confirmation Modal (Single/Bulk Images, Volumes, Containers, Networks) */}
+      <dialog
+        ref={confirmActionDialogRef}
+        aria-labelledby="confirm-action-title"
+        onClose={(e) => {
+          const dlg = e.currentTarget;
+          const choice = dlg.returnValue;
+          dlg.returnValue = '';
+          if (choice === 'confirm' && confirmState) {
+            confirmState.onConfirm();
+          }
+        }}
+      >
+        <div className="p-4 space-y-3 text-xs">
+          <h2
+            id="confirm-action-title"
+            className="text-sm font-semibold text-rose-400"
+          >
+            {confirmState?.title || 'Confirm Delete'}
+          </h2>
+          <p className="text-[var(--text-muted)] leading-relaxed">
+            {confirmState?.description}
+          </p>
+          <form method="dialog" className="flex justify-end gap-2 pt-2">
+            <button
+              value="cancel"
+              autoFocus
+              className="px-3 py-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-canvas)] font-medium"
+            >
+              Cancel
+            </button>
+            <button
+              value="confirm"
+              className="px-3 py-1.5 rounded-md bg-rose-600 text-white font-semibold hover:bg-rose-500"
+            >
+              {confirmState?.confirmLabel || 'Delete'}
+            </button>
+          </form>
+        </div>
+      </dialog>
     </div>
   );
 }
@@ -1765,6 +2685,7 @@ interface ComposeStackRowsProps {
   isSelectedStack: boolean;
   selectedContainerId: string | null;
   compact: boolean;
+  pendingActions: Record<string, string>;
   onToggleCollapse: () => void;
   onSelectStack: () => void;
   onSelectContainer: (ctr: ContainerSummary, tab?: ContainerTab) => void;
@@ -1784,12 +2705,15 @@ function ComposeStackRows({
   isSelectedStack,
   selectedContainerId,
   compact,
+  pendingActions,
   onToggleCollapse,
   onSelectStack,
   onSelectContainer,
   onContainerAction,
   onComposeAction,
 }: ComposeStackRowsProps) {
+  const stackPending = pendingActions[`stack:${group.name}`];
+
   return (
     <>
       <tr
@@ -1823,8 +2747,8 @@ function ComposeStackRows({
                 group.status === 'running'
                   ? 'bg-emerald-500/15 text-emerald-400'
                   : group.status === 'partial'
-                  ? 'bg-amber-500/15 text-amber-400'
-                  : 'bg-zinc-500/20 text-[var(--text-muted)]'
+                    ? 'bg-amber-500/15 text-amber-400'
+                    : 'bg-zinc-500/20 text-[var(--text-muted)]'
               }`}
             >
               {group.runningCount}/{group.totalCount}
@@ -1837,21 +2761,28 @@ function ComposeStackRows({
           </td>
         )}
         <td className="py-2 px-2.5">
-          <span
-            className={
-              group.status === 'running'
-                ? 'text-emerald-400'
+          {stackPending ? (
+            <span className="text-sky-400 inline-flex items-center gap-1 font-mono">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>{stackPending}ing...</span>
+            </span>
+          ) : (
+            <span
+              className={
+                group.status === 'running'
+                  ? 'text-emerald-400'
+                  : group.status === 'partial'
+                    ? 'text-amber-400'
+                    : 'text-[var(--text-muted)]'
+              }
+            >
+              {group.status === 'running'
+                ? 'Active'
                 : group.status === 'partial'
-                ? 'text-amber-400'
-                : 'text-[var(--text-muted)]'
-            }
-          >
-            {group.status === 'running'
-              ? 'Active'
-              : group.status === 'partial'
-              ? 'Partial'
-              : 'Stopped'}
-          </span>
+                  ? 'Partial'
+                  : 'Stopped'}
+            </span>
+          )}
         </td>
         <td className="py-2 px-2.5 font-mono text-[var(--text-muted)]">
           {group.exposedPorts?.length > 0
@@ -1879,22 +2810,26 @@ function ComposeStackRows({
             </button>
             <button
               type="button"
+              disabled={!!stackPending}
               onClick={() => onComposeAction(group.name, 'restart')}
-              className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle"
+              className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle disabled:opacity-50"
               title="Restart stack"
               aria-label={`Restart ${group.name} stack`}
             >
-              <RotateCw className="w-3 h-3" />
+              <RotateCw
+                className={`w-3 h-3 ${stackPending === 'restart' ? 'animate-spin' : ''}`}
+              />
             </button>
             <button
               type="button"
+              disabled={!!stackPending}
               onClick={() =>
                 onComposeAction(
                   group.name,
                   group.runningCount > 0 ? 'stop' : 'start'
                 )
               }
-              className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle"
+              className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle disabled:opacity-50"
               title={group.runningCount > 0 ? 'Stop stack' : 'Start stack'}
               aria-label={
                 group.runningCount > 0
@@ -1902,7 +2837,9 @@ function ComposeStackRows({
                   : `Start ${group.name} stack`
               }
             >
-              {group.runningCount > 0 ? (
+              {stackPending === 'stop' || stackPending === 'start' ? (
+                <Loader2 className="w-3 h-3 animate-spin text-sky-400" />
+              ) : group.runningCount > 0 ? (
                 <Square className="w-3 h-3 text-rose-400" />
               ) : (
                 <Play className="w-3 h-3 text-emerald-400" />
@@ -1919,6 +2856,7 @@ function ComposeStackRows({
             ctr={ctr}
             indented={true}
             compact={compact}
+            pendingAction={pendingActions[`ctr:${ctr.id}`]}
             isSelected={selectedContainerId === ctr.id}
             onSelect={(tab) => onSelectContainer(ctr, tab)}
             onAction={onContainerAction}
@@ -1932,6 +2870,7 @@ interface ContainerRowProps {
   ctr: ContainerSummary;
   indented: boolean;
   compact: boolean;
+  pendingAction?: string;
   isSelected: boolean;
   onSelect: (tab?: ContainerTab) => void;
   onAction: (
@@ -1944,6 +2883,7 @@ function ContainerRow({
   ctr,
   indented,
   compact,
+  pendingAction,
   isSelected,
   onSelect,
   onAction,
@@ -1983,9 +2923,16 @@ function ContainerRow({
       )}
 
       <td className="py-2 px-2.5">
-        <span className={isRunning ? 'text-emerald-400' : 'text-[var(--text-muted)]'}>
-          {ctr.status}
-        </span>
+        {pendingAction ? (
+          <span className="text-sky-400 inline-flex items-center gap-1 font-mono">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>{pendingAction}ing...</span>
+          </span>
+        ) : (
+          <span className={isRunning ? 'text-emerald-400' : 'text-[var(--text-muted)]'}>
+            {ctr.status}
+          </span>
+        )}
       </td>
 
       <td className="py-2 px-2.5 font-mono" onClick={(e) => e.stopPropagation()}>
@@ -2041,38 +2988,52 @@ function ContainerRow({
             <>
               <button
                 type="button"
+                disabled={!!pendingAction}
                 onClick={() => onAction(ctr.id, 'restart')}
-                className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle"
+                className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle disabled:opacity-50"
                 title="Restart"
                 aria-label={`Restart ${ctr.name}`}
               >
-                <RotateCw className="w-3 h-3" />
+                <RotateCw
+                  className={`w-3 h-3 ${pendingAction === 'restart' ? 'animate-spin' : ''}`}
+                />
               </button>
               <button
                 type="button"
+                disabled={!!pendingAction}
                 onClick={() => onAction(ctr.id, 'stop')}
-                className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle"
+                className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:bg-[var(--bg-elevated)] align-middle disabled:opacity-50"
                 title="Stop"
                 aria-label={`Stop ${ctr.name}`}
               >
-                <Square className="w-3 h-3 text-rose-400" />
+                {pendingAction === 'stop' ? (
+                  <Loader2 className="w-3 h-3 animate-spin text-sky-400" />
+                ) : (
+                  <Square className="w-3 h-3 text-rose-400" />
+                )}
               </button>
             </>
           ) : (
             <button
               type="button"
+              disabled={!!pendingAction}
               onClick={() => onAction(ctr.id, 'start')}
-              className="p-1 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-400 align-middle"
+              className="p-1 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-400 align-middle disabled:opacity-50"
               title="Start"
               aria-label={`Start ${ctr.name}`}
             >
-              <Play className="w-3 h-3" />
+              {pendingAction === 'start' ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Play className="w-3 h-3" />
+              )}
             </button>
           )}
           <button
             type="button"
+            disabled={!!pendingAction}
             onClick={() => onAction(ctr.id, 'delete')}
-            className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:text-rose-400 align-middle"
+            className="p-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-card)] hover:text-rose-400 align-middle disabled:opacity-50"
             title="Delete"
             aria-label={`Delete ${ctr.name}`}
           >

@@ -242,3 +242,32 @@ func TestClientOverUnixSocket(t *testing.T) {
 		t.Fatalf("expected TotalReclaimable 2725, got %d", df.TotalReclaimable)
 	}
 }
+
+func TestClassifyVolumeContents(t *testing.T) {
+	if !isHexHash64(strings.Repeat("a1b2c3d4", 8)) {
+		t.Fatal("expected 64-char hex string to be detected as anonymous hash")
+	}
+	if isHexHash64("my-named-postgres-volume") {
+		t.Fatal("expected named volume not to be detected as anonymous hash")
+	}
+
+	cases := []struct {
+		entries []string
+		size    int64
+		want    string
+	}{
+		{nil, 0, "Empty volume"},
+		{[]string{"buildkit", "containers", "image", "overlay2", "volumes"}, 1024, "Docker-in-Docker (/var/lib/docker)"},
+		{[]string{"PG_VERSION", "base", "global", "pg_wal", "postgresql.conf"}, 1024, "PostgreSQL database"},
+		{[]string{"18"}, 1024, "PostgreSQL 18 data (18/)"},
+		{[]string{"mnesia", ".erlang.cookie"}, 1024, "RabbitMQ data (mnesia)"},
+		{[]string{".bin", "react", "typescript", "vite"}, 1024, "Node.js packages (node_modules)"},
+		{[]string{"dump.rdb"}, 1024, "Redis persistence data"},
+	}
+	for _, tc := range cases {
+		got := inferVolumeContentHint(tc.entries, tc.size)
+		if got != tc.want {
+			t.Fatalf("inferVolumeContentHint(%v, %d) = %q, want %q", tc.entries, tc.size, got, tc.want)
+		}
+	}
+}

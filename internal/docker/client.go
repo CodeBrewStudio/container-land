@@ -24,6 +24,9 @@ type Client struct {
 	addr       string // socket path or host:port
 	displayURI string
 	httpClient *http.Client
+
+	volMu    sync.Mutex
+	volCache map[string][]string
 }
 
 // ResolveEndpoint determines the Docker socket/endpoint in portable priority order:
@@ -210,11 +213,14 @@ func (c *Client) ListContainers(ctx context.Context, withStats bool) (Containers
 		return ContainersResponse{}, err
 	}
 
-	summaries := make([]ContainerSummary, len(rawList))
-	for i, rc := range rawList {
+	summaries := make([]ContainerSummary, 0, len(rawList))
+	for _, rc := range rawList {
 		name := rc.ID
 		if len(rc.Names) > 0 {
 			name = strings.TrimPrefix(rc.Names[0], "/")
+		}
+		if strings.HasPrefix(name, "container-land-vol-probe") || rc.Labels["io.container-land.internal"] == "volume-probe" {
+			continue
 		}
 		shortID := rc.ID
 		if len(shortID) > 12 {
@@ -240,7 +246,7 @@ func (c *Client) ListContainers(ctx context.Context, withStats bool) (Containers
 		// Deduplicate and sort port bindings
 		ports := dedupePorts(rc.Ports)
 
-		summaries[i] = ContainerSummary{
+		summaries = append(summaries, ContainerSummary{
 			ID:                 rc.ID,
 			ShortID:            shortID,
 			Name:               name,
@@ -258,7 +264,7 @@ func (c *Client) ListContainers(ctx context.Context, withStats bool) (Containers
 			ComposeConfigFiles: rc.Labels["com.docker.compose.project.config_files"],
 			Mounts:             mounts,
 			Networks:           netNames,
-		}
+		})
 	}
 
 	if withStats {
@@ -1007,10 +1013,14 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeSummary, error) {
 
 	ctrs, _ := c.ListContainers(ctx, false)
 	usedByMap := make(map[string][]string)
+	mountPathsMap := make(map[string][]string)
 	recordMounts := func(ctr ContainerSummary) {
 		for _, m := range ctr.Mounts {
 			if m.Type == "volume" && m.Name != "" {
 				usedByMap[m.Name] = append(usedByMap[m.Name], ctr.Name)
+				if m.Destination != "" {
+					mountPathsMap[m.Name] = append(mountPathsMap[m.Name], ctr.Name+":"+m.Destination)
+				}
 			}
 		}
 	}
@@ -1026,14 +1036,27 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeSummary, error) {
 	out := make([]VolumeSummary, 0, len(rawVols.Volumes))
 	for _, rv := range rawVols.Volumes {
 		usedBy := usedByMap[rv.Name]
+		mountPaths := mountPathsMap[rv.Name]
 		size := int64(-1)
 		if s, ok := volSizes[rv.Name]; ok {
 			size = s
 		} else if rv.UsageData != nil {
 			size = rv.UsageData.Size
 		}
+
+		_, hasAnonLabel := rv.Labels["com.docker.volume.anonymous"]
+		anon := hasAnonLabel || isHexHash64(rv.Name)
+		shortName := rv.Name
+		if anon && len(shortName) > 12 {
+			shortName = shortName[:12]
+		}
+		composeProject := rv.Labels["com.docker.compose.project"]
+
 		out = append(out, VolumeSummary{
 			Name:             rv.Name,
+			ShortName:        shortName,
+			Anonymous:        anon,
+			ComposeProject:   composeProject,
 			Driver:           rv.Driver,
 			Mountpoint:       rv.Mountpoint,
 			CreatedAt:        rv.CreatedAt,
@@ -1043,8 +1066,11 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeSummary, error) {
 			RefCount:         int64(len(usedBy)),
 			InUse:            len(usedBy) > 0,
 			UsedByContainers: usedBy,
+			MountPaths:       mountPaths,
 		})
 	}
+
+	c.enrichVolumesWithContents(ctx, out)
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].InUse != out[j].InUse {
@@ -1412,6 +1438,9 @@ func (c *Client) StreamEvents(ctx context.Context, onEvent func(DaemonEvent) err
 				return nil
 			}
 			return err
+		}
+		if strings.HasPrefix(raw.Actor.Attributes["name"], "container-land-vol-probe") || raw.Actor.Attributes["io.container-land.internal"] == "volume-probe" {
+			continue
 		}
 		ev := DaemonEvent{
 			Type:   raw.Type,

@@ -10,8 +10,8 @@ Container Land gives you the everyday features of Docker Desktop on Linux withou
 - **Dual-Mode Right Slide-Over Inspector**:
   - **Compose Stack Mode**: Click any Compose group row to stream live, interleaved, colour-coded logs across every container in the stack with instant service filter pills and aggregated stack CPU/RAM metrics.
   - **Container Mode**: Click any container row for live SSE logs (`stdout`/`stderr` demuxed, search, timestamps, download), an interactive WebSocket TTY shell (`bash`/`sh`), live 1-second CPU/Memory/Network/Block I/O charts, structured Environment & Mounts inspection, and raw Inspect JSON.
-- **Images, Volumes & Networks**: Browse, search, inspect, pull images with live progress, see which containers reference each image/volume/network, and clean up unused resources.
-- **Host Telemetry & Safe Prune Centre**: Live Linux `/proc` CPU, per-core load, memory, swap, and filesystem telemetry alongside Docker's `/system/df` breakdown. Safe-by-default System Prune reclaims stopped containers, unused images, and build cache while protecting named volumes unless explicitly opted in.
+- **Images, Volumes & Networks**: Browse, search, pull images with live progress, bulk-select images or volumes with checkboxes, and inspect unattached anonymous volumes with automatic read-only content signature detection (PostgreSQL, RabbitMQ, Redis, Node `node_modules`, Docker-in-Docker, or empty volumes).
+- **Docker vs Host Telemetry & Safe Prune Centre**: Dual-colour stacked progress bars showing Docker's exact share of CPU, RAM, and disk versus the rest of the Linux host, a per-stack and per-container live RAM/CPU consumer breakdown showing how much memory is freed if stopped, and a safe-by-default Disk Prune Builder that protects local volumes unless explicitly opted in.
 - **Portable & Rootless-Ready**: Auto-discovers standard (`/var/run/docker.sock`), rootless (`$XDG_RUNTIME_DIR/docker.sock`), and custom (`DOCKER_HOST` / `--socket`) endpoints. Ships as a single self-contained Go binary with embedded web assets.
 
 ## Quick Start
