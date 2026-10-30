@@ -1,0 +1,25 @@
+# Binaries & build outputs
+bin/
+dist/
+internal/server/dist/
+web/dist/
+web/node_modules/
+*.exe
+*.out
+*.test
+*.tsbuildinfo
+
+# Coverage & test artifacts
+coverage.out
+coverage.html
+
+# Local environment & editor files
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local planning / scratch docs
+docs/plans/

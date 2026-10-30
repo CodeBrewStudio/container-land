@@ -1,0 +1,12 @@
+[Unit]
+Description=Container Land — Local Docker Engine Web Interface
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/container-land --addr 127.0.0.1:8485
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
