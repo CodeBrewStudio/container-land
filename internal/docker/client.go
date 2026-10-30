@@ -64,6 +64,25 @@ func ResolveEndpoint(explicit string) (network, addr, displayURI string) {
 		}
 	}
 
+	if fi, err := os.Stat("/var/run/docker.sock"); err == nil && !fi.IsDir() {
+		return "unix", "/var/run/docker.sock", "unix:///var/run/docker.sock"
+	}
+
+	// Check common user-scoped sockets on macOS and Linux (Docker Desktop, OrbStack, Colima, Rancher Desktop)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates := []string{
+			filepath.Join(home, ".docker", "run", "docker.sock"),
+			filepath.Join(home, ".orbstack", "run", "docker.sock"),
+			filepath.Join(home, ".colima", "default", "docker.sock"),
+			filepath.Join(home, ".rd", "docker.sock"),
+		}
+		for _, cand := range candidates {
+			if fi, sErr := os.Stat(cand); sErr == nil && !fi.IsDir() {
+				return "unix", cand, "unix://" + cand
+			}
+		}
+	}
+
 	defaultSock := "/var/run/docker.sock"
 	return "unix", defaultSock, "unix://" + defaultSock
 }

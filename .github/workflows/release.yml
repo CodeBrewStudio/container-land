@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build & Test Frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm test -- --run
+          npm run build
+
+      - name: Copy Embedded Dist
+        run: |
+          rm -rf internal/server/dist
+          cp -r web/dist internal/server/dist
+
+      - name: Run Go Tests
+        run: |
+          go vet ./...
+          go test -v -race ./...
+
+      - name: Build Cross-Platform Binaries & Archives
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p release
+          TARGETS=(
+            "linux:amd64"
+            "linux:arm64"
+            "darwin:arm64"
+            "darwin:amd64"
+          )
+          for target in "${TARGETS[@]}"; do
+            GOOS="${target%%:*}"
+            GOARCH="${target##*:}"
+            BIN_NAME="container-land-${GOOS}-${GOARCH}"
+            echo "Building ${BIN_NAME} (${VERSION})..."
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+              go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "release/${BIN_NAME}" ./cmd/container-land
+            chmod +x "release/${BIN_NAME}"
+
+            # Also package a tar.gz containing `container-land`, `LICENSE`, and `README.md`
+            STAGE_DIR="release/stage-${GOOS}-${GOARCH}"
+            mkdir -p "${STAGE_DIR}"
+            cp "release/${BIN_NAME}" "${STAGE_DIR}/container-land"
+            cp LICENSE README.md "${STAGE_DIR}/"
+            tar -C "${STAGE_DIR}" -czf "release/${BIN_NAME}.tar.gz" container-land LICENSE README.md
+            rm -rf "${STAGE_DIR}"
+          done
+
+          cd release
+          sha256sum container-land-* > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/container-land-linux-amd64
+            release/container-land-linux-arm64
+            release/container-land-darwin-arm64
+            release/container-land-darwin-amd64
+            release/container-land-linux-amd64.tar.gz
+            release/container-land-linux-arm64.tar.gz
+            release/container-land-darwin-arm64.tar.gz
+            release/container-land-darwin-amd64.tar.gz
+            release/checksums.txt

@@ -119,6 +119,19 @@ func (s *Server) buildOverview(ctx context.Context, forceDF bool) (OverviewRespo
 		return OverviewResponse{}, err
 	}
 	hostSnap := s.host.Collect(info.DockerRootDir)
+	// Fallback to Docker Engine /info metrics on non-Linux hosts (e.g. macOS) where /proc is unavailable
+	if hostSnap.MemTotalBytes == 0 && info.MemTotal > 0 {
+		hostSnap.MemTotalBytes = uint64(info.MemTotal)
+	}
+	if hostSnap.CPUCores == 0 && info.NCPU > 0 {
+		hostSnap.CPUCores = info.NCPU
+	}
+	if hostSnap.KernelVersion == "" && info.KernelVersion != "" {
+		hostSnap.KernelVersion = info.KernelVersion
+	}
+	if hostSnap.CPUModel == "" && info.OperatingSystem != "" {
+		hostSnap.CPUModel = info.OperatingSystem + " (" + info.Architecture + ")"
+	}
 	df, _ := s.getDiskUsageCached(ctx, forceDF)
 
 	ctrs, _ := s.docker.ListContainers(ctx, false)

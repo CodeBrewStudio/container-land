@@ -4,9 +4,17 @@ If you run Docker natively on Linux, you already get the best part of the deal: 
 
 Most alternatives either want you to run a bloated VM anyway (the horror!) or ask you to spin up a management container with a database just to look at your other containers.
 
-I built **Container Land** to fix that. It is a single, self-contained Go binary with an embedded web UI that talks directly to your local Docker socket (`/var/run/docker.sock` or rootless) and runs quietly as a user `systemd` service on `http://127.0.0.1:8485`.
+I built **Container Land** to fix that. It is a single, self-contained Go binary with an embedded web UI that talks directly to your local Docker socket (`/var/run/docker.sock`, Rootless Docker, or macOS runtimes) and runs quietly in the background on `http://127.0.0.1:8485`.
 
 ![Containers and Compose Stack Interleaved Logs](docs/screenshots/01-compose-stack-logs.png)
+
+## Supported Platforms
+
+Container Land ships pre-built, zero-dependency static binaries for:
+
+- **Linux (`amd64` and `arm64`)**: First-class native support (reads host telemetry directly from `/proc` and `statfs`, and manages a user `systemd` service).
+- **Windows (via WSL2)**: Run the `linux-amd64` (or `linux-arm64`) binary inside your WSL2 distribution where Docker Engine lives. WSL2 automatically forwards `http://127.0.0.1:8485` straight to your Windows browser.
+- **macOS (`arm64` Apple Silicon and `amd64` Intel)**: Works out of the box with OrbStack, Colima, Rancher Desktop, or Docker Desktop. Auto-discovers `~/.orbstack/run/docker.sock`, `~/.colima/default/docker.sock`, and `~/.docker/run/docker.sock`, and can install a user `LaunchAgent` so it starts automatically on login.
 
 ## What it does (and why)
 
@@ -43,7 +51,7 @@ Container Land solves this by performing a fast, read-only inspection of volume 
 
 ### 5. Docker vs Host resource telemetry and safe pruning
 
-System monitors like `htop` or `btop` already show you what your Linux box is doing overall. What you actually want to know in a container manager is how much of your machine **Docker** is eating, which specific containers are responsible, and what you can get back if you stop or prune them.
+System monitors like `htop` or `btop` already show you what your machine is doing overall. What you actually want to know in a container manager is how much of your machine **Docker** is eating, which specific containers are responsible, and what you can get back if you stop or prune them.
 
 ![Resources and Prune Centre](docs/screenshots/05-resources-and-prune.png)
 
@@ -53,94 +61,133 @@ The **Resources & Prune** page (and the persistent top telemetry bar) uses dual-
 - **Consumption by Running Compose Stack & Container**: A live leaderboard ranking your active Compose stacks and containers by memory footprint, complete with one-click **Stop (Free X MB)** buttons when a runaway service needs to be put to bed.
 - **Safe Disk Prune Builder**: Breaks down `/system/df` across Images, Build Cache, Stopped Containers, and Local Volumes. Named and anonymous volumes are **excluded by default** (protected behind a separate warning checkbox and confirmation modal) so a routine disk cleanup never nukes your local database state.
 
-## Setup & Installation Guide
+## Installation & Setup Guide
 
-### Prerequisites
+### Option 1: Download Pre-built Binary (Quickest, no Go or Node required)
 
-- **Linux** with a running Docker Engine (standard rootful `/var/run/docker.sock` or Rootless Docker).
-- **Go 1.23+** and **Node.js 20+** (only needed if you are building from source).
+Every tagged release publishes standalone binaries on the [GitHub Releases](https://github.com/CodeBrewStudio/container-land/releases) page. The binary includes a built-in `--install-service` flag so you do not even need to clone the repository to set up the background service.
 
-### 1. Clone and build the single binary
-
-Building the project compiles the React + TypeScript frontend into static assets, embeds them into the Go server via `go:embed`, and outputs a single portable binary at `./bin/container-land`:
+#### Linux (x86_64 / `amd64`) & Windows WSL2
 
 ```bash
-git clone https://github.com/jgunnink/container-land.git
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/CodeBrewStudio/container-land/releases/latest/download/container-land-linux-amd64 \
+  -o ~/.local/bin/container-land
+chmod +x ~/.local/bin/container-land
+
+# Install and start the background user systemd service on http://127.0.0.1:8485
+~/.local/bin/container-land --install-service
+```
+
+*(For ARM64 Linux machines like Raspberry Pi or ARM cloud boxes, replace `container-land-linux-amd64` with `container-land-linux-arm64`.)*
+
+#### macOS (Apple Silicon `arm64` / Intel `amd64`)
+
+```bash
+mkdir -p ~/.local/bin
+ARCH=$(uname -m | sed 's/x86_64/amd64/')
+curl -fsSL "https://github.com/CodeBrewStudio/container-land/releases/latest/download/container-land-darwin-${ARCH}" \
+  -o ~/.local/bin/container-land
+chmod +x ~/.local/bin/container-land
+
+# Install and start the background macOS LaunchAgent on http://127.0.0.1:8485
+~/.local/bin/container-land --install-service
+```
+
+Once installed, open [http://127.0.0.1:8485](http://127.0.0.1:8485) in your browser. If you prefer not to run a background service, skip `--install-service` and just run `~/.local/bin/container-land --open` whenever you want it.
+
+### Option 2: Build from Source
+
+If you want to build from source (requires **Go 1.23+** and **Node.js 20+**):
+
+```bash
+git clone https://github.com/CodeBrewStudio/container-land.git
 cd container-land
+
+# Build the frontend and compile ./bin/container-land
 make build
-```
 
-### 2. Run it directly (ad-hoc mode)
-
-If you just want to spin it up in your terminal right now:
-
-```bash
+# Run directly and open in browser
 ./bin/container-land --open
-```
 
-This starts the server on [http://127.0.0.1:8485](http://127.0.0.1:8485) and opens your default browser.
-
-### 3. Install as a background user `systemd` service (Recommended)
-
-If you want Container Land to always be there at `http://127.0.0.1:8485` whenever you log in (without needing `sudo` or a root daemon):
-
-```bash
+# Or install binary to ~/.local/bin and enable the user systemd service
 make install-service
 ```
 
-Under the hood, this:
-1. Builds `./bin/container-land` and installs it to `~/.local/bin/container-land`.
-2. Installs the portable user unit file to `~/.config/systemd/user/container-land.service`.
-3. Runs `systemctl --user daemon-reload && systemctl --user enable --now container-land.service`.
+## How to Use It & Permissions Required
 
-Useful commands for managing the background service:
+### Does Container Land need `root` or `sudo`?
+
+**No.** Container Land runs as your normal desktop user on an unprivileged loopback port (`127.0.0.1:8485`), and its background service runs under your user session (`systemctl --user` on Linux, or `~/Library/LaunchAgents` on macOS).
+
+### Docker Socket Permissions
+
+The only permission Container Land needs is read/write access to your local Docker Engine socket (the exact same permission required to run `docker ps` in your terminal without `sudo`):
+
+1. **Standard Linux Docker (`/var/run/docker.sock`)**:
+   Make sure your Linux user is in the `docker` group:
+   ```bash
+   sudo usermod -aG docker $USER
+   newgrp docker
+   ```
+   *(If you just added yourself to the `docker` group and already have the user `systemd` service running, restart it with `systemctl --user restart container-land.service`.)*
+2. **Rootless Docker on Linux (`$XDG_RUNTIME_DIR/docker.sock`)**:
+   Works out of the box with zero extra groups or permissions because the socket is owned by your user.
+3. **macOS (OrbStack, Colima, Docker Desktop)**:
+   Works out of the box because the socket in `~/.orbstack/run/docker.sock`, `~/.colima/default/docker.sock`, or `~/.docker/run/docker.sock` is already owned by your macOS user.
+
+### Managing the Background Service
 
 ```bash
-# Check service status
+# Linux: check status or tail logs
 systemctl --user status container-land.service
-
-# Tail live daemon logs
 journalctl --user -u container-land.service -f
 
-# Restart after pulling updates
-make install-service && systemctl --user restart container-land.service
-
-# Stop and remove the user systemd service
-make uninstall-service
+# Stop and remove the background service (Linux or macOS)
+~/.local/bin/container-land --uninstall-service
 ```
 
 ## Configuration (CLI Flags & Environment Variables)
 
-Container Land works out of the box with zero configuration, auto-discovering your Docker socket in the following order:
+Container Land auto-discovers your Docker socket in the following priority order:
 1. `--socket` CLI flag
 2. `DOCKER_HOST` environment variable
 3. `$XDG_RUNTIME_DIR/docker.sock` (Rootless Docker on Linux)
 4. `/var/run/docker.sock` (Standard Linux Docker Engine)
+5. `~/.docker/run/docker.sock`, `~/.orbstack/run/docker.sock`, `~/.colima/default/docker.sock`, `~/.rd/docker.sock` (macOS & user-scoped runtimes)
 
 | CLI Flag | Environment Variable | Default | Description |
 |---|---|---|---|
 | `--addr` | `CONTAINER_LAND_ADDR` | `127.0.0.1:8485` | HTTP listen address and port |
 | `--socket` | `DOCKER_HOST` | Auto-discovered | Docker socket path (`unix:///var/run/docker.sock` or `tcp://...`) |
 | `--open` | None | `false` | Automatically open the web UI in your default browser on startup |
-| `--version` | None | None | Print the binary version and exit |
+| `--install-service` | None | `false` | Copy binary to `~/.local/bin/container-land` and enable user `systemd` service (Linux) or `LaunchAgent` (macOS) |
+| `--uninstall-service` | None | `false` | Stop and remove the background user service |
+| `--version` | None | None | Print the binary version and platform and exit |
 
-## Development & Testing
-
- The repository is split cleanly between the zero-dependency Go backend and the React 19 + TypeScript + Tailwind CSS frontend:
+## Development, CI & Releases
 
 | Path | Purpose |
 |---|---|
-| `cmd/container-land/` | CLI entry point and graceful shutdown |
+| `cmd/container-land/` | CLI entry point, service installer, and graceful shutdown |
 | `internal/docker/` | Unix/TCP Docker Engine client, 8-byte stream demultiplexer, Compose grouper, volume content inspector, and TTY `exec` hijacker |
 | `internal/host/` | Linux `/proc` (`stat`, `meminfo`, `loadavg`, `uptime`, `hwmon`) and `statfs` reader |
 | `internal/server/` | HTTP API, SSE streams (daemon events, container logs, Compose logs, live stats), WebSocket `exec` bridge, and embedded SPA |
 | `web/` | React 19 + TypeScript + Tailwind CSS + `xterm.js` frontend |
-| `systemd/` | Portable user `systemd` service unit (`%h/.local/bin/container-land`) |
+| `.github/workflows/ci.yml` | Runs Vitest, TypeScript, Vite build, `go vet`, `go test -race`, and cross-compile checks on every PR and push |
+| `.github/workflows/release.yml` | Builds `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `darwin/amd64` binaries + `checksums.txt` and publishes a GitHub Release whenever a `v*` tag is pushed |
 
-To run the full test suite (Go `-race` unit/integration tests, Vitest frontend tests, TypeScript typecheck, and Vite production build):
+To run all checks locally:
 
 ```bash
 make test
+```
+
+To cut a new release once pushed to GitHub:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 ## Security Notes
@@ -149,4 +196,4 @@ Container Land communicates directly with your local Docker Engine socket, which
 
 ## Licence
 
-Released under the [MIT Licence](./LICENSE). If you run into a bug or have an idea that would make daily Docker life on Linux better, issues and pull requests are very welcome.
+Released under the [MIT Licence](./LICENSE). If you run into a bug or have an idea that would make daily Docker life better, issues and pull requests are very welcome.

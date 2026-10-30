@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
@@ -41,6 +44,10 @@ jobs:
           go vet ./...
           go test -v -race ./...
 
-      - name: Build Binary
+      - name: Cross-Compile Release Targets (Linux & macOS)
         run: |
-          go build -trimpath -ldflags="-s -w" -o bin/container-land ./cmd/container-land
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/container-land-linux-amd64 ./cmd/container-land
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o bin/container-land-linux-arm64 ./cmd/container-land
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o bin/container-land-darwin-arm64 ./cmd/container-land
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/container-land-darwin-amd64 ./cmd/container-land
