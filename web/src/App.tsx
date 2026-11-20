@@ -46,6 +46,10 @@ import {
   type DrawerSelection,
   RightDrawer,
 } from './components/RightDrawer';
+import {
+  reconcileContainerDrawerSelection,
+  reconcileVolumeDrawerSelection,
+} from './utils/drawer';
 
 type MainView = 'containers' | 'images' | 'volumes' | 'networks' | 'resources';
 type ColorSchemeSetting = 'light dark' | 'dark' | 'light';
@@ -221,28 +225,9 @@ export function App() {
       if (r.ok) {
         const data = (await r.json()) as ContainersResponse;
         setContainersData(data);
-        setDrawerSelection((prev) => {
-          if (!prev) return null;
-          if (prev.kind === 'volume') return prev;
-          if (prev.kind === 'compose') {
-            const updatedGroup = data.composeGroups.find(
-              (g) => g.name === prev.group.name
-            );
-            return updatedGroup ? { kind: 'compose', group: updatedGroup } : null;
-          }
-          const allCtrs = [
-            ...data.composeGroups.flatMap((g) => g.containers),
-            ...(data.standalone ?? []),
-          ];
-          const updatedCtr = allCtrs.find((c) => c.id === prev.container.id);
-          return updatedCtr
-            ? {
-                kind: 'container',
-                container: updatedCtr,
-                initialTab: prev.initialTab,
-              }
-            : null;
-        });
+        setDrawerSelection((prev) =>
+          reconcileContainerDrawerSelection(prev, data)
+        );
       }
     } catch {
       // ignore
@@ -283,11 +268,9 @@ export function App() {
           });
           return next;
         });
-        setDrawerSelection((prev) => {
-          if (!prev || prev.kind !== 'volume') return prev;
-          const updated = list.find((v) => v.name === prev.volume.name);
-          return updated ? { kind: 'volume', volume: updated } : null;
-        });
+        setDrawerSelection((prev) =>
+          reconcileVolumeDrawerSelection(prev, list)
+        );
       }
     } catch {
       // ignore
