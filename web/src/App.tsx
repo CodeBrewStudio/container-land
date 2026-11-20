@@ -317,11 +317,59 @@ export function App() {
       }
     });
 
-    es.addEventListener('docker', () => {
-      fetchContainers(true);
-      fetchImages();
-      fetchVolumes();
-      fetchNetworks();
+    const pendingTypes = new Set<string>();
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushDockerEvents = () => {
+      debounceTimer = null;
+      const types = new Set(pendingTypes);
+      pendingTypes.clear();
+
+      if (types.has('all') || types.has('container')) {
+        fetchContainers(true);
+      }
+      if (types.has('all') || types.has('image')) {
+        fetchImages();
+      }
+      if (types.has('all') || types.has('volume')) {
+        fetchVolumes();
+      }
+      if (types.has('all') || types.has('network')) {
+        fetchNetworks();
+      }
+    };
+
+    es.addEventListener('docker', (ev) => {
+      try {
+        const parsed = JSON.parse((ev as MessageEvent).data) as {
+          type?: string;
+          action?: string;
+        };
+        const evType = parsed.type ?? '';
+        const evAction = parsed.action ?? '';
+        if (evType === 'container') {
+          pendingTypes.add('container');
+          if (
+            evAction === 'create' ||
+            evAction === 'destroy' ||
+            evAction === 'start' ||
+            evAction === 'die'
+          ) {
+            pendingTypes.add('image');
+            pendingTypes.add('volume');
+            pendingTypes.add('network');
+          }
+        } else if (evType === 'image' || evType === 'volume' || evType === 'network') {
+          pendingTypes.add(evType);
+        } else {
+          pendingTypes.add('all');
+        }
+      } catch {
+        pendingTypes.add('all');
+      }
+
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(flushDockerEvents, 350);
     });
 
     const interval = setInterval(() => {
@@ -329,6 +377,7 @@ export function App() {
     }, 5000);
 
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       clearInterval(interval);
       es.close();
     };
