@@ -18,6 +18,12 @@ import (
 	"time"
 )
 
+type volCacheEntry struct {
+	entries  []string
+	cachedAt time.Time
+	failed   bool
+}
+
 // Client communicates with a local Docker Engine over Unix domain socket or TCP.
 type Client struct {
 	network    string // "unix" or "tcp"
@@ -25,8 +31,10 @@ type Client struct {
 	displayURI string
 	httpClient *http.Client
 
-	volMu    sync.Mutex
-	volCache map[string][]string
+	volMu             sync.Mutex
+	volProbeMu        sync.Mutex
+	volCache          map[string]volCacheEntry
+	probeBlockedUntil time.Time
 }
 
 // ResolveEndpoint determines the Docker socket/endpoint in portable priority order:
@@ -1103,7 +1111,8 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeSummary, error) {
 
 // CreateVolume creates a named Docker volume.
 func (c *Client) CreateVolume(ctx context.Context, name string) error {
-	payload, _ := json.Marshal(map[string]string{"Name": strings.TrimSpace(name)})
+	trimmed := strings.TrimSpace(name)
+	payload, _ := json.Marshal(map[string]string{"Name": trimmed})
 	resp, err := c.doRequest(ctx, http.MethodPost, "/volumes/create", bytes.NewReader(payload), map[string]string{
 		"Content-Type": "application/json",
 	})
@@ -1111,6 +1120,7 @@ func (c *Client) CreateVolume(ctx context.Context, name string) error {
 		return err
 	}
 	resp.Body.Close()
+	c.invalidateVolumeCache(trimmed)
 	return nil
 }
 
@@ -1125,6 +1135,7 @@ func (c *Client) RemoveVolume(ctx context.Context, name string, force bool) erro
 		return err
 	}
 	resp.Body.Close()
+	c.invalidateVolumeCache(name)
 	return nil
 }
 
@@ -1428,6 +1439,9 @@ func (c *Client) Prune(ctx context.Context, req PruneRequest) (PruneResponse, er
 		out.VolumesDeleted = res.VolumesDeleted
 		out.ReclaimedVolumesBytes = res.SpaceReclaimed
 		out.TotalReclaimedBytes += res.SpaceReclaimed
+		for _, v := range res.VolumesDeleted {
+			c.invalidateVolumeCache(v)
+		}
 	}
 
 	return out, nil

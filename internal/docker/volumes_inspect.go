@@ -14,7 +14,19 @@ import (
 	"time"
 )
 
-const probeContainerPrefix = "container-land-vol-probe"
+const (
+	probeContainerPrefix = "container-land-vol-probe"
+	volCacheTTL          = 5 * time.Minute
+	volProbeFailTTL      = 2 * time.Minute
+)
+
+func (c *Client) invalidateVolumeCache(name string) {
+	c.volMu.Lock()
+	defer c.volMu.Unlock()
+	if c.volCache != nil {
+		delete(c.volCache, name)
+	}
+}
 
 func isHexHash64(s string) bool {
 	if len(s) != 64 {
@@ -89,54 +101,110 @@ func (c *Client) enrichVolumesWithContents(ctx context.Context, vols []VolumeSum
 		return
 	}
 
-	c.volMu.Lock()
-	if c.volCache == nil {
-		c.volCache = make(map[string][]string)
+	now := time.Now()
+	present := make(map[string]struct{}, len(vols))
+	for _, v := range vols {
+		present[v.Name] = struct{}{}
 	}
-	var uncachedIndices []int
-	for i := range vols {
-		if entries, ok := c.volCache[vols[i].Name]; ok {
-			vols[i].TopEntries = entries
-			vols[i].ContentHint = inferVolumeContentHint(entries, vols[i].SizeBytes)
-			continue
+
+	collectUncached := func() []int {
+		c.volMu.Lock()
+		defer c.volMu.Unlock()
+		if c.volCache == nil {
+			c.volCache = make(map[string]volCacheEntry)
 		}
-		// Try direct host read first (works in rootless mode or when running with access to Mountpoint)
-		if vols[i].Mountpoint != "" {
-			if dirEntries, err := os.ReadDir(vols[i].Mountpoint); err == nil {
-				var names []string
-				for _, de := range dirEntries {
-					names = append(names, de.Name())
-					if len(names) >= 12 {
-						break
-					}
-				}
-				c.volCache[vols[i].Name] = names
-				vols[i].TopEntries = names
-				vols[i].ContentHint = inferVolumeContentHint(names, vols[i].SizeBytes)
-				continue
+		// Evict keys for volumes that no longer exist to keep the cache bounded.
+		for k := range c.volCache {
+			if _, ok := present[k]; !ok {
+				delete(c.volCache, k)
 			}
 		}
-		uncachedIndices = append(uncachedIndices, i)
-	}
-	c.volMu.Unlock()
 
+		var uncached []int
+		for i := range vols {
+			if entry, ok := c.volCache[vols[i].Name]; ok {
+				ttl := volCacheTTL
+				if entry.failed {
+					ttl = volProbeFailTTL
+				}
+				if now.Sub(entry.cachedAt) < ttl {
+					if !entry.failed {
+						vols[i].TopEntries = entry.entries
+						vols[i].ContentHint = inferVolumeContentHint(entry.entries, vols[i].SizeBytes)
+					} else if vols[i].SizeBytes == 0 {
+						vols[i].ContentHint = "Empty volume"
+					}
+					continue
+				}
+			}
+			// Try direct host read first (works in rootless mode or when running with access to Mountpoint)
+			if vols[i].Mountpoint != "" {
+				if dirEntries, err := os.ReadDir(vols[i].Mountpoint); err == nil {
+					var names []string
+					for _, de := range dirEntries {
+						names = append(names, de.Name())
+						if len(names) >= 12 {
+							break
+						}
+					}
+					c.volCache[vols[i].Name] = volCacheEntry{entries: names, cachedAt: now}
+					vols[i].TopEntries = names
+					vols[i].ContentHint = inferVolumeContentHint(names, vols[i].SizeBytes)
+					continue
+				}
+			}
+			uncached = append(uncached, i)
+		}
+		return uncached
+	}
+
+	uncachedIndices := collectUncached()
 	if len(uncachedIndices) == 0 {
 		return
 	}
 
-	probeResults := c.runVolumeBatchProbe(ctx, vols, uncachedIndices)
+	// Serialise container probing so concurrent /api/volumes requests don't spawn duplicate probe containers.
+	c.volProbeMu.Lock()
+	defer c.volProbeMu.Unlock()
+
+	// Re-check cache after acquiring the probe lock in case another goroutine just populated it.
+	now = time.Now()
+	uncachedIndices = collectUncached()
+	if len(uncachedIndices) == 0 {
+		return
+	}
+
+	c.volMu.Lock()
+	blocked := now.Before(c.probeBlockedUntil)
+	c.volMu.Unlock()
+	if blocked {
+		for _, idx := range uncachedIndices {
+			if vols[idx].SizeBytes == 0 {
+				vols[idx].ContentHint = "Empty volume"
+			}
+		}
+		return
+	}
+
+	probeResults, probeOK := c.runVolumeBatchProbe(ctx, vols, uncachedIndices)
+	now = time.Now()
 
 	c.volMu.Lock()
 	defer c.volMu.Unlock()
+	if !probeOK {
+		c.probeBlockedUntil = now.Add(volProbeFailTTL)
+	}
 	for _, idx := range uncachedIndices {
 		vName := vols[idx].Name
 		if entries, ok := probeResults[idx]; ok {
-			c.volCache[vName] = entries
+			c.volCache[vName] = volCacheEntry{entries: entries, cachedAt: now}
 			vols[idx].TopEntries = entries
 			vols[idx].ContentHint = inferVolumeContentHint(entries, vols[idx].SizeBytes)
 		} else if vols[idx].SizeBytes == 0 {
-			c.volCache[vName] = []string{}
+			c.volCache[vName] = volCacheEntry{entries: []string{}, cachedAt: now}
 			vols[idx].ContentHint = "Empty volume"
+		} else {
+			c.volCache[vName] = volCacheEntry{cachedAt: now, failed: true}
 		}
 	}
 }
@@ -169,11 +237,11 @@ func (c *Client) pickLocalHelperImage(ctx context.Context) string {
 	return ""
 }
 
-func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, indices []int) map[int][]string {
+func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, indices []int) (map[int][]string, bool) {
 	out := make(map[int][]string, len(indices))
 	helperImage := c.pickLocalHelperImage(ctx)
 	if helperImage == "" {
-		return out
+		return out, false
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
@@ -205,7 +273,7 @@ func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, 
 		"Content-Type": "application/json",
 	})
 	if err != nil {
-		return out
+		return out, false
 	}
 	var created struct {
 		ID string `json:"Id"`
@@ -213,7 +281,7 @@ func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, 
 	_ = json.NewDecoder(resp.Body).Decode(&created)
 	resp.Body.Close()
 	if created.ID == "" {
-		return out
+		return out, false
 	}
 	defer func() {
 		rmCtx, rmCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -223,7 +291,7 @@ func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, 
 
 	startResp, err := c.doRequest(probeCtx, http.MethodPost, fmt.Sprintf("/containers/%s/start", url.PathEscape(created.ID)), nil, nil)
 	if err != nil {
-		return out
+		return out, false
 	}
 	startResp.Body.Close()
 
@@ -235,7 +303,7 @@ func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, 
 
 	logResp, err := c.doRequest(probeCtx, http.MethodGet, fmt.Sprintf("/containers/%s/logs?stdout=true&stderr=false", url.PathEscape(created.ID)), nil, nil)
 	if err != nil {
-		return out
+		return out, false
 	}
 	defer logResp.Body.Close()
 
@@ -256,5 +324,5 @@ func (c *Client) runVolumeBatchProbe(ctx context.Context, vols []VolumeSummary, 
 		return nil
 	})
 
-	return out
+	return out, len(out) > 0
 }

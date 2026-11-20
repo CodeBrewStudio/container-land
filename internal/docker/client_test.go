@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -269,5 +270,75 @@ func TestClassifyVolumeContents(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("inferVolumeContentHint(%v, %d) = %q, want %q", tc.entries, tc.size, got, tc.want)
 		}
+	}
+}
+
+func TestVolumeProbeNegativeCachingAndEviction(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "docker.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var createCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/volumes", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Volumes": []map[string]any{
+				{
+					"Name":       "mystery-vol",
+					"Driver":     "local",
+					"Mountpoint": "/nonexistent/docker/volumes/mystery-vol/_data",
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/system/df", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Volumes": []map[string]any{
+				{"Name": "mystery-vol", "UsageData": map[string]any{"Size": 1024, "RefCount": 0}},
+			},
+		})
+	})
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("/images/json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"RepoTags": []string{"distroless/static:latest"}, "Size": 2000},
+		})
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		createCalls.Add(1)
+		http.Error(w, `{"message":"no /bin/sh"}`, http.StatusInternalServerError)
+	})
+
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	client := NewClient(sockPath)
+	ctx := context.Background()
+
+	// First call attempts probe once and negative-caches the failure.
+	if _, err := client.ListVolumes(ctx); err != nil {
+		t.Fatalf("first ListVolumes failed: %v", err)
+	}
+	// Second call must not spawn another failing probe container.
+	if _, err := client.ListVolumes(ctx); err != nil {
+		t.Fatalf("second ListVolumes failed: %v", err)
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 probe create attempt due to negative caching, got %d", got)
+	}
+
+	// Verify explicit invalidation removes cached entry.
+	client.invalidateVolumeCache("mystery-vol")
+	client.volMu.Lock()
+	_, stillCached := client.volCache["mystery-vol"]
+	client.volMu.Unlock()
+	if stillCached {
+		t.Fatal("expected invalidateVolumeCache to remove volume entry")
 	}
 }
