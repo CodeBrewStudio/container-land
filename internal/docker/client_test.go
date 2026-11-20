@@ -342,3 +342,49 @@ func TestVolumeProbeNegativeCachingAndEviction(t *testing.T) {
 		t.Fatal("expected invalidateVolumeCache to remove volume entry")
 	}
 }
+
+func TestVolumeProbeCapsBatchSize(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "docker.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var observedBinds int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/images/json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"RepoTags": []string{"alpine:latest"}, "Size": 5000},
+		})
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			HostConfig struct {
+				Binds []string `json:"Binds"`
+			} `json:"HostConfig"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		observedBinds = len(body.HostConfig.Binds)
+		http.Error(w, `{"message":"stop after inspect"}`, http.StatusInternalServerError)
+	})
+
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	vols := make([]VolumeSummary, maxProbeVolumesPerBatch+50)
+	for i := range vols {
+		vols[i] = VolumeSummary{
+			Name:      strings.Repeat("v", 4) + string(rune('a'+(i%26))) + string(rune('0'+(i%10))),
+			SizeBytes: int64(i + 1),
+		}
+	}
+
+	client := NewClient(sockPath)
+	client.enrichVolumesWithContents(context.Background(), vols)
+
+	if observedBinds != maxProbeVolumesPerBatch {
+		t.Fatalf("expected probe binds to be capped at %d, got %d", maxProbeVolumesPerBatch, observedBinds)
+	}
+}

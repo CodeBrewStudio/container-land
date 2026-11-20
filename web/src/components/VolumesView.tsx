@@ -1,7 +1,10 @@
-import { Plus, Search, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ChevronLeft, ChevronRight, Plus, Search, Trash2 } from 'lucide-react';
 import type { OverviewResponse, VolumeSummary } from '../types';
 import { formatBytes, formatRelativeTime } from '../utils/format';
 import { type DrawerSelection, RightDrawer } from './RightDrawer';
+
+export const VOLUME_PAGE_SIZE = 100;
 
 export interface VolumesViewProps {
   volumes: VolumeSummary[];
@@ -48,6 +51,22 @@ export function VolumesView({
   onOpenCreateVolumeDialog,
   onOpenVolumePruneDialog,
 }: VolumesViewProps) {
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(filteredVolumes.length / VOLUME_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+
+  useEffect(() => {
+    setPage(1);
+  }, [volumeQuery, volumeFilter]);
+
+  const pageVolumes = useMemo(() => {
+    const start = (safePage - 1) * VOLUME_PAGE_SIZE;
+    return filteredVolumes.slice(start, start + VOLUME_PAGE_SIZE);
+  }, [filteredVolumes, safePage]);
+
+  const startRow = filteredVolumes.length === 0 ? 0 : (safePage - 1) * VOLUME_PAGE_SIZE + 1;
+  const endRow = Math.min(safePage * VOLUME_PAGE_SIZE, filteredVolumes.length);
+
   return (
             <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
               <div className="px-4 py-2.5 border-b border-[var(--border-subtle)] bg-[var(--bg-card)] flex flex-wrap items-center justify-between gap-2">
@@ -156,7 +175,7 @@ export function VolumesView({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[var(--border-subtle)]">
-                      {filteredVolumes.map((vol) => {
+                      {pageVolumes.map((vol) => {
                         const isChecked = selectedVolumeNames.has(vol.name);
                         const isSelectedDrawer =
                           drawerSelection?.kind === 'volume' &&
@@ -316,6 +335,38 @@ export function VolumesView({
                   />
                 )}
               </div>
+
+              {filteredVolumes.length > VOLUME_PAGE_SIZE && (
+                <div className="px-4 py-2 border-t border-[var(--border-subtle)] bg-[var(--bg-card)] flex items-center justify-between text-xs font-mono">
+                  <span className="text-[var(--text-muted)]">
+                    Showing {startRow.toLocaleString()}–{endRow.toLocaleString()} of{' '}
+                    {filteredVolumes.length.toLocaleString()} volumes
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={safePage <= 1}
+                      onClick={() => setPage((p) => Math.max(1, p - 1))}
+                      className="px-2 py-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-elevated)] disabled:opacity-40 inline-flex items-center gap-1 font-sans"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      <span>Prev</span>
+                    </button>
+                    <span className="text-[var(--text-muted)]">
+                      Page {safePage.toLocaleString()} / {totalPages.toLocaleString()}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={safePage >= totalPages}
+                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                      className="px-2 py-1 rounded border border-[var(--border-subtle)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-elevated)] disabled:opacity-40 inline-flex items-center gap-1 font-sans"
+                    >
+                      <span>Next</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
   );
 }

@@ -9,15 +9,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	probeContainerPrefix = "container-land-vol-probe"
-	volCacheTTL          = 5 * time.Minute
-	volProbeFailTTL      = 2 * time.Minute
+	probeContainerPrefix    = "container-land-vol-probe"
+	volCacheTTL             = 5 * time.Minute
+	volProbeFailTTL         = 2 * time.Minute
+	maxProbeVolumesPerBatch = 64
 )
 
 func (c *Client) invalidateVolumeCache(name string) {
@@ -121,6 +123,7 @@ func (c *Client) enrichVolumesWithContents(ctx context.Context, vols []VolumeSum
 		}
 
 		var uncached []int
+		directReadBlocked := false
 		for i := range vols {
 			if entry, ok := c.volCache[vols[i].Name]; ok {
 				ttl := volCacheTTL
@@ -138,8 +141,9 @@ func (c *Client) enrichVolumesWithContents(ctx context.Context, vols []VolumeSum
 				}
 			}
 			// Try direct host read first (works in rootless mode or when running with access to Mountpoint)
-			if vols[i].Mountpoint != "" {
-				if dirEntries, err := os.ReadDir(vols[i].Mountpoint); err == nil {
+			if !directReadBlocked && vols[i].Mountpoint != "" {
+				dirEntries, err := os.ReadDir(vols[i].Mountpoint)
+				if err == nil {
 					var names []string
 					for _, de := range dirEntries {
 						names = append(names, de.Name())
@@ -151,6 +155,9 @@ func (c *Client) enrichVolumesWithContents(ctx context.Context, vols []VolumeSum
 					vols[i].TopEntries = names
 					vols[i].ContentHint = inferVolumeContentHint(names, vols[i].SizeBytes)
 					continue
+				}
+				if os.IsPermission(err) {
+					directReadBlocked = true
 				}
 			}
 			uncached = append(uncached, i)
@@ -184,6 +191,25 @@ func (c *Client) enrichVolumesWithContents(ctx context.Context, vols []VolumeSum
 			}
 		}
 		return
+	}
+
+	// Cap the number of volumes mounted into a single probe container so hosts with
+	// thousands of volumes don't stall or hit Docker bind-mount limits.
+	// Prioritise attached volumes and largest volumes first.
+	if len(uncachedIndices) > maxProbeVolumesPerBatch {
+		sort.SliceStable(uncachedIndices, func(a, b int) bool {
+			va, vb := vols[uncachedIndices[a]], vols[uncachedIndices[b]]
+			if va.InUse != vb.InUse {
+				return va.InUse
+			}
+			return va.SizeBytes > vb.SizeBytes
+		})
+		for _, idx := range uncachedIndices[maxProbeVolumesPerBatch:] {
+			if vols[idx].SizeBytes == 0 {
+				vols[idx].ContentHint = "Empty volume"
+			}
+		}
+		uncachedIndices = uncachedIndices[:maxProbeVolumesPerBatch]
 	}
 
 	probeResults, probeOK := c.runVolumeBatchProbe(ctx, vols, uncachedIndices)

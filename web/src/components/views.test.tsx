@@ -8,7 +8,7 @@ vi.mock('./ExecTerminal', () => ({
 import type { ImageSummary, NetworkSummary, VolumeSummary } from '../types';
 import { ImagesView } from './ImagesView';
 import { NetworksView } from './NetworksView';
-import { VolumesView } from './VolumesView';
+import { VolumesView, VOLUME_PAGE_SIZE } from './VolumesView';
 
 describe('View components', () => {
   it('NetworksView hides Remove button for built-in networks and shows it for custom ones', () => {
@@ -149,5 +149,53 @@ describe('View components', () => {
 
     expect(html).toContain('PostgreSQL database');
     expect(html).toContain('aaaaaaaaaaaa');
+  });
+
+  it('VolumesView paginates large volume lists so the DOM stays bounded', () => {
+    const vols: VolumeSummary[] = Array.from({ length: VOLUME_PAGE_SIZE + 50 }, (_, i) => ({
+      name: `vol-${i}`,
+      shortName: `vol-${i}`,
+      anonymous: false,
+      driver: 'local',
+      mountpoint: `/var/lib/docker/volumes/vol-${i}/_data`,
+      createdAt: '2026-01-01T00:00:00Z',
+      labels: {},
+      scope: 'local',
+      sizeBytes: 1024,
+      refCount: 0,
+      inUse: false,
+      usedByContainers: [],
+      contentHint: 'Empty volume',
+    }));
+
+    const html = renderToStaticMarkup(
+      <VolumesView
+        volumes={vols}
+        filteredVolumes={vols}
+        volumeQuery=""
+        setVolumeQuery={vi.fn()}
+        volumeFilter="all"
+        setVolumeFilter={vi.fn()}
+        selectedVolumeNames={new Set()}
+        allFilteredVolumesSelected={false}
+        toggleSelectAllVolumes={vi.fn()}
+        toggleSelectVolume={vi.fn()}
+        overview={null}
+        drawerSelection={null}
+        setDrawerSelection={vi.fn()}
+        setActiveView={vi.fn()}
+        confirmDeleteSelectedVolumes={vi.fn()}
+        confirmDeleteSingleVolume={vi.fn()}
+        handleContainerAction={vi.fn()}
+        handleComposeAction={vi.fn()}
+        onOpenCreateVolumeDialog={vi.fn()}
+        onOpenVolumePruneDialog={vi.fn()}
+      />
+    );
+
+    expect(html).toContain('vol-0');
+    expect(html).toContain(`vol-${VOLUME_PAGE_SIZE - 1}`);
+    expect(html).not.toContain(`vol-${VOLUME_PAGE_SIZE}`);
+    expect(html).toContain('Page 1 / 2');
   });
 });

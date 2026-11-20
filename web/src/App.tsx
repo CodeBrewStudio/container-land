@@ -74,7 +74,14 @@ export function App() {
   });
   const [images, setImages] = useState<ImageSummary[]>([]);
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
+  const [volumesLoaded, setVolumesLoaded] = useState(false);
   const [networks, setNetworks] = useState<NetworkSummary[]>([]);
+  const activeViewRef = useRef<MainView>(activeView);
+  const volumesInFlightRef = useRef(false);
+
+  useEffect(() => {
+    activeViewRef.current = activeView;
+  }, [activeView]);
 
   // Containers view UI state
   const [containerQuery, setContainerQuery] = useState('');
@@ -245,11 +252,16 @@ export function App() {
   }, []);
 
   const fetchVolumes = useCallback(async () => {
+    if (volumesInFlightRef.current) {
+      return;
+    }
+    volumesInFlightRef.current = true;
     try {
       const r = await fetch('/api/volumes');
       if (r.ok) {
         const list = (await r.json()) as VolumeSummary[];
         setVolumes(list);
+        setVolumesLoaded(true);
         setSelectedVolumeNames((prev) => {
           const valid = new Set(list.map((v) => v.name));
           const next = new Set<string>();
@@ -264,6 +276,8 @@ export function App() {
       }
     } catch {
       // ignore
+    } finally {
+      volumesInFlightRef.current = false;
     }
   }, []);
 
@@ -291,7 +305,6 @@ export function App() {
     fetchOverview();
     fetchContainers(false).then(() => fetchContainers(true));
     fetchImages();
-    fetchVolumes();
     fetchNetworks();
 
     const es = new EventSource('/api/events');
@@ -321,7 +334,7 @@ export function App() {
       if (types.has('all') || types.has('image')) {
         fetchImages();
       }
-      if (types.has('all') || types.has('volume')) {
+      if ((types.has('all') || types.has('volume')) && activeViewRef.current === 'volumes') {
         fetchVolumes();
       }
       if (types.has('all') || types.has('network')) {
@@ -372,6 +385,14 @@ export function App() {
       es.close();
     };
   }, [fetchOverview, fetchContainers, fetchImages, fetchVolumes, fetchNetworks]);
+
+  // Lazy-load volumes when navigating to the Volumes view so hosts with thousands of volumes
+  // don't pay a multi-megabyte fetch on initial dashboard load.
+  useEffect(() => {
+    if (activeView === 'volumes' && !volumesLoaded) {
+      fetchVolumes();
+    }
+  }, [activeView, volumesLoaded, fetchVolumes]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -1129,7 +1150,9 @@ export function App() {
                 <Database className="w-3.5 h-3.5" />
                 <span>Volumes</span>
               </span>
-              <span className="font-mono tabular-nums">{volumes.length}</span>
+              <span className="font-mono tabular-nums">
+                {volumesLoaded ? volumes.length : (overview?.volumeCount ?? 0)}
+              </span>
             </button>
 
             <button

@@ -236,6 +236,11 @@ func (c *Client) StreamEvents(ctx context.Context, onEvent func(DaemonEvent) err
 		if strings.HasPrefix(raw.Actor.Attributes["name"], "container-land-vol-probe") || raw.Actor.Attributes["io.container-land.internal"] == "volume-probe" {
 			continue
 		}
+		// Skip high-frequency volume mount/unmount events (including those emitted by our
+		// own volume probe container) so they don't trigger feedback loops of /api/volumes refreshes.
+		if raw.Type == "volume" && (raw.Action == "mount" || raw.Action == "unmount") {
+			continue
+		}
 		ev := DaemonEvent{
 			Type:   raw.Type,
 			Action: raw.Action,
