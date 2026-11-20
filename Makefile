@@ -4,6 +4,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 BINARY := bin/container-land
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0)
 
 .PHONY: all build-web build test dev install install-service uninstall-service clean
 
@@ -16,7 +17,7 @@ build-web:
 
 build: build-web
 	mkdir -p bin
-	$(GO) build -trimpath -ldflags="-s -w" -o $(BINARY) ./cmd/container-land
+	$(GO) build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o $(BINARY) ./cmd/container-land
 
 test: build-web
 	$(GO) test -v -race ./...
