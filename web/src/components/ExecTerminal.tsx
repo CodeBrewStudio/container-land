@@ -54,6 +54,7 @@ export function ExecTerminal({ containerId, containerName, isRunning }: ExecTerm
     )}/exec?cols=${term.cols || 100}&rows=${term.rows || 28}${shellQuery}`;
 
     const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
       setConnected(true);
@@ -67,7 +68,9 @@ export function ExecTerminal({ containerId, containerName, isRunning }: ExecTerm
     };
 
     ws.onmessage = (ev) => {
-      if (typeof ev.data === 'string') {
+      if (ev.data instanceof ArrayBuffer) {
+        term.write(new Uint8Array(ev.data));
+      } else if (typeof ev.data === 'string') {
         term.write(ev.data);
       }
     };

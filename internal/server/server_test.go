@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"net"
@@ -235,5 +236,35 @@ func TestSameOriginAndShellValidation(t *testing.T) {
 	badShellResp.Body.Close()
 	if badShellResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for disallowed shell, got %d", badShellResp.StatusCode)
+	}
+}
+
+func TestWSBinaryFrameRoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	writer := &WSConn{conn: c1, reader: bufio.NewReader(c1)}
+	reader := &WSConn{conn: c2, reader: bufio.NewReader(c2)}
+
+	// Partial multi-byte UTF-8 sequence (first 2 bytes of €)
+	chunk := []byte{0xE2, 0x82}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- writer.WriteBinary(chunk)
+	}()
+
+	op, payload, err := reader.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage failed: %v", err)
+	}
+	if writeErr := <-errCh; writeErr != nil {
+		t.Fatalf("WriteBinary failed: %v", writeErr)
+	}
+	if op != wsOpBinary {
+		t.Fatalf("expected binary opcode %d, got %d", wsOpBinary, op)
+	}
+	if !bytes.Equal(payload, chunk) {
+		t.Fatalf("expected payload %x, got %x", chunk, payload)
 	}
 }

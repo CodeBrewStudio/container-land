@@ -387,7 +387,7 @@ func (s *Server) handleContainerExecWS(w http.ResponseWriter, r *http.Request, i
 		for {
 			n, rErr := session.Reader.Read(buf)
 			if n > 0 {
-				if wErr := ws.WriteText(string(buf[:n])); wErr != nil {
+				if wErr := ws.WriteBinary(buf[:n]); wErr != nil {
 					return
 				}
 			}
