@@ -268,3 +268,59 @@ func TestWSBinaryFrameRoundTrip(t *testing.T) {
 		t.Fatalf("expected payload %x, got %x", chunk, payload)
 	}
 }
+
+func TestOverviewAvoidsRedundantContainerList(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "docker.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	containerListCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"Name": "test-host", "DockerRootDir": "/var/lib/docker"})
+	})
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"Version": "29.9.2", "ApiVersion": "1.56"})
+	})
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		containerListCalls++
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("/networks", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"Id": "n1"}, {"Id": "n2"}})
+	})
+	mux.HandleFunc("/volumes", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"Volumes": []map[string]any{{"Name": "v1"}}})
+	})
+	mux.HandleFunc("/system/df", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"LayersSize": 100})
+	})
+
+	httpSrv := &http.Server{Handler: mux}
+	go func() { _ = httpSrv.Serve(ln) }()
+	t.Cleanup(func() { _ = httpSrv.Close() })
+
+	srv := New(docker.NewClient(sockPath), host.NewCollector())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/overview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var ov OverviewResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ov); err != nil {
+		t.Fatal(err)
+	}
+	if containerListCalls != 1 {
+		t.Fatalf("expected /containers/json to be called once during overview, got %d", containerListCalls)
+	}
+	if ov.NetworkCount != 2 || ov.VolumeCount != 1 {
+		t.Fatalf("unexpected counts: networks=%d volumes=%d", ov.NetworkCount, ov.VolumeCount)
+	}
+}

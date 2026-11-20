@@ -160,12 +160,12 @@ func (s *Server) buildOverview(ctx context.Context, forceDF bool) (OverviewRespo
 	df, _ := s.getDiskUsageCached(ctx, forceDF)
 
 	ctrs, _ := s.docker.ListContainers(ctx, false)
-	nets, _ := s.docker.ListNetworks(ctx)
+	netCount, _ := s.docker.CountNetworks(ctx)
 
 	volCount := df.VolumesTotal
 	if volCount == 0 {
-		if vols, vErr := s.docker.ListVolumes(ctx); vErr == nil {
-			volCount = len(vols)
+		if cnt, vErr := s.docker.CountVolumes(ctx); vErr == nil {
+			volCount = cnt
 		}
 	}
 
@@ -175,7 +175,7 @@ func (s *Server) buildOverview(ctx context.Context, forceDF bool) (OverviewRespo
 		DiskUsage:         df,
 		ComposeStackCount: len(ctrs.ComposeGroups),
 		VolumeCount:       volCount,
-		NetworkCount:      len(nets),
+		NetworkCount:      netCount,
 	}, nil
 }
 

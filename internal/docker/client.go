@@ -394,10 +394,13 @@ func groupContainers(all []ContainerSummary) ContainersResponse {
 	}
 }
 
+const maxConcurrentStatsRequests = 8
+
 func (c *Client) populateRunningStats(ctx context.Context, containers []ContainerSummary) {
 	statsCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 	defer cancel()
 
+	sem := make(chan struct{}, maxConcurrentStatsRequests)
 	var wg sync.WaitGroup
 	for i := range containers {
 		if containers[i].State != "running" {
@@ -406,6 +409,12 @@ func (c *Client) populateRunningStats(ctx context.Context, containers []Containe
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-statsCtx.Done():
+				return
+			}
 			st, err := c.GetContainerStatsSnapshot(statsCtx, containers[idx].ID)
 			if err != nil {
 				return
@@ -1107,6 +1116,30 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeSummary, error) {
 	})
 
 	return out, nil
+}
+
+// CountVolumes returns the total number of Docker volumes without fetching disk usage or probing contents.
+func (c *Client) CountVolumes(ctx context.Context) (int, error) {
+	var rawVols struct {
+		Volumes []struct {
+			Name string `json:"Name"`
+		} `json:"Volumes"`
+	}
+	if err := c.getJSON(ctx, "/volumes", &rawVols); err != nil {
+		return 0, err
+	}
+	return len(rawVols.Volumes), nil
+}
+
+// CountNetworks returns the total number of Docker networks without cross-referencing containers.
+func (c *Client) CountNetworks(ctx context.Context) (int, error) {
+	var rawNets []struct {
+		ID string `json:"Id"`
+	}
+	if err := c.getJSON(ctx, "/networks", &rawNets); err != nil {
+		return 0, err
+	}
+	return len(rawNets), nil
 }
 
 // CreateVolume creates a named Docker volume.
