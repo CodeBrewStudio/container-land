@@ -125,19 +125,35 @@ export function RightDrawer({
         : `/api/compose/${encodeURIComponent(selection.group.name)}/logs?tail=120`;
 
     const es = new EventSource(url);
+    const pending: LogEntry[] = [];
+    let rafId: number | null = null;
+
+    const flushLogs = () => {
+      rafId = null;
+      if (pending.length === 0) return;
+      const batch = pending.splice(0, pending.length);
+      setLogs((prev) => {
+        const next = prev.concat(batch);
+        return next.length > 1500 ? next.slice(next.length - 1500) : next;
+      });
+    };
+
     es.addEventListener('log', (ev) => {
       try {
         const entry = JSON.parse((ev as MessageEvent).data) as LogEntry;
-        setLogs((prev) => {
-          const next = [...prev, entry];
-          return next.length > 1500 ? next.slice(next.length - 1500) : next;
-        });
+        pending.push(entry);
+        if (rafId === null) {
+          rafId = window.requestAnimationFrame(flushLogs);
+        }
       } catch {
         // ignore malformed line
       }
     });
 
     return () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+      }
       es.close();
     };
   }, [selectionKey, selection.kind, activeTab]);
