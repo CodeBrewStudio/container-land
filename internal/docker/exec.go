@@ -10,7 +10,27 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 )
+
+// ResolveExecShell validates a user-requested shell selector against an allowlist
+// and returns the command string passed to /bin/sh -c.
+func ResolveExecShell(raw string) (string, error) {
+	switch strings.TrimSpace(raw) {
+	case "", "auto":
+		return "command -v bash >/dev/null 2>&1 && exec bash || exec sh", nil
+	case "/bin/bash", "exec /bin/bash":
+		return "exec /bin/bash", nil
+	case "/bin/sh", "exec /bin/sh":
+		return "exec /bin/sh", nil
+	case "/bin/ash", "exec /bin/ash":
+		return "exec /bin/ash", nil
+	case "/bin/zsh", "exec /bin/zsh":
+		return "exec /bin/zsh", nil
+	default:
+		return "", fmt.Errorf("unsupported shell %q", raw)
+	}
+}
 
 // ExecSession represents a hijacked bidirectional TTY stream inside a running container.
 type ExecSession struct {
@@ -29,15 +49,16 @@ func (s *ExecSession) Close() error {
 
 // CreateAndStartExec creates an interactive TTY exec instance inside container id and hijacks the stream.
 func (c *Client) CreateAndStartExec(ctx context.Context, containerID string, shellCmd string, cols, rows int) (*ExecSession, error) {
-	if shellCmd == "" {
-		shellCmd = "command -v bash >/dev/null 2>&1 && exec bash || exec sh"
+	resolvedShell, err := ResolveExecShell(shellCmd)
+	if err != nil {
+		return nil, err
 	}
 	createBody, _ := json.Marshal(map[string]any{
 		"AttachStdin":  true,
 		"AttachStdout": true,
 		"AttachStderr": true,
 		"Tty":          true,
-		"Cmd":          []string{"/bin/sh", "-c", shellCmd},
+		"Cmd":          []string{"/bin/sh", "-c", resolvedShell},
 		"Env":          []string{"TERM=xterm-256color"},
 	})
 

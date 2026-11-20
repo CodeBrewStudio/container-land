@@ -33,6 +33,9 @@ type WSConn struct {
 
 // UpgradeWebSocket upgrades an HTTP request to a WebSocket connection.
 func UpgradeWebSocket(w http.ResponseWriter, r *http.Request) (*WSConn, error) {
+	if !isSameOriginRequest(r) {
+		return nil, errors.New("cross-origin websocket upgrade rejected")
+	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		return nil, errors.New("missing websocket upgrade header")
 	}

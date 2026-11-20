@@ -48,7 +48,7 @@ export function ExecTerminal({ containerId, containerName, isRunning }: ExecTerm
     const shellQuery =
       shellMode === 'auto'
         ? ''
-        : `&shell=${encodeURIComponent(`exec ${shellMode}`)}`;
+        : `&shell=${encodeURIComponent(shellMode)}`;
     const wsUrl = `${proto}//${window.location.host}/api/containers/${encodeURIComponent(
       containerId
     )}/exec?cols=${term.cols || 100}&rows=${term.rows || 28}${shellQuery}`;

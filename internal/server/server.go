@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +50,31 @@ func New(dockerClient *docker.Client, hostCollector *host.Collector) *Server {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	isWSUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	isAPIMutation := strings.HasPrefix(r.URL.Path, "/api/") &&
+		r.Method != http.MethodGet &&
+		r.Method != http.MethodHead &&
+		r.Method != http.MethodOptions
+	if (isWSUpgrade || isAPIMutation) && !isSameOriginRequest(r) {
+		writeError(w, http.StatusForbidden, "cross-origin request blocked")
+		return
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+func isSameOriginRequest(r *http.Request) bool {
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+			return false
+		}
+	}
+	if sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
+		if !strings.EqualFold(sfs, "same-origin") && !strings.EqualFold(sfs, "none") {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) registerRoutes() {
@@ -322,6 +347,12 @@ func (s *Server) handleContainerStatsSSE(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleContainerExecWS(w http.ResponseWriter, r *http.Request, id string) {
+	shell := r.URL.Query().Get("shell")
+	if _, err := docker.ResolveExecShell(shell); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	ws, err := UpgradeWebSocket(w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -337,7 +368,6 @@ func (s *Server) handleContainerExecWS(w http.ResponseWriter, r *http.Request, i
 	if rows <= 0 {
 		rows = 28
 	}
-	shell := r.URL.Query().Get("shell")
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

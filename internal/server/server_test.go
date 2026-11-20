@@ -166,3 +166,74 @@ func TestServerEndpoints(t *testing.T) {
 		t.Fatalf("expected 200 for SPA root, got %d", spaResp.StatusCode)
 	}
 }
+
+func TestSameOriginAndShellValidation(t *testing.T) {
+	sock := newMockDockerSocket(t)
+	srv := New(docker.NewClient(sock), host.NewCollector())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Cross-origin POST must be rejected with 403
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/compose/acme/restart", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin POST, got %d", resp.StatusCode)
+	}
+
+	// Cross-site Sec-Fetch-Site POST without Origin must also be rejected
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/compose/acme/restart", nil)
+	req2.Header.Set("Sec-Fetch-Site", "cross-site")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-site Sec-Fetch-Site POST, got %d", resp2.StatusCode)
+	}
+
+	// Same-origin POST must succeed
+	req3, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/compose/acme/restart", nil)
+	req3.Header.Set("Origin", ts.URL)
+	req3.Header.Set("Sec-Fetch-Site", "same-origin")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for same-origin POST, got %d", resp3.StatusCode)
+	}
+
+	// Cross-origin WebSocket upgrade must be rejected with 403
+	wsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/containers/c111/exec", nil)
+	wsReq.Header.Set("Connection", "Upgrade")
+	wsReq.Header.Set("Upgrade", "websocket")
+	wsReq.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	wsReq.Header.Set("Origin", "https://evil.example")
+	wsResp, err := http.DefaultClient.Do(wsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsResp.Body.Close()
+	if wsResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin WebSocket upgrade, got %d", wsResp.StatusCode)
+	}
+
+	// Disallowed shell query parameter must be rejected with 400
+	badShellReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/containers/c111/exec?shell=id;rm+-rf+/", nil)
+	badShellReq.Header.Set("Origin", ts.URL)
+	badShellResp, err := http.DefaultClient.Do(badShellReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badShellResp.Body.Close()
+	if badShellResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for disallowed shell, got %d", badShellResp.StatusCode)
+	}
+}
